@@ -25,7 +25,7 @@ class ModuleRegistry
             }
 
             return $module;
-        }, config('modules.registered', []));
+        }, (array) config('modules.registered', []));
     }
 
     public function find(string $slug): ?ModuleContract
