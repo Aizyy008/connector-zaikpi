@@ -23,14 +23,18 @@ use Illuminate\Support\Str;
  * another's. See the data dictionary for the 3 options this design was chosen from (client
  * decision: option 1 — per-vendor credentials, zero Rocket LMS source changes).
  *
- * All 6 KPIs below trace to a real, live-confirmed field — nothing guessed. `RL-SUBSCRIPTIONS`
- * stays excluded (the `installment` mechanism hasn't been inspected yet — logged as an open
- * obstruction, not silently dropped).
+ * All 7 KPIs below trace to a real, confirmed field or model — nothing guessed. `RL-SUBSCRIPTIONS`
+ * was resolved by reading `SubscribesController`/`Sale.php` source (2026-08-31): Rocket LMS's
+ * "subscribe" feature is a course-access plan, not recurring billing — redeeming it against a
+ * course creates a normal `sales` row with `payment_method === 'subscribe'` (`Sale::$subscribe`),
+ * so it's computed from the SAME `financial/sales` pull as RL-SALES/RL-REFUNDS, no new endpoint.
+ * The `installment` folder (a separate, unrelated "pay for one course in instalments" feature)
+ * was checked and confirmed NOT to be the subscription mechanism.
  */
 class PullRocketLmsMeasurementsAction extends AbstractModule
 {
     private const KPI_CODES = [
-        'RL-SALES', 'RL-REFUNDS', 'RL-ENROLLMENTS',
+        'RL-SALES', 'RL-REFUNDS', 'RL-ENROLLMENTS', 'RL-SUBSCRIPTIONS',
         'RL-ACTIVE-LEARNERS', 'RL-VENDOR-ACTIVITY', 'RL-COURSE-COMPLETION',
     ];
 
@@ -137,8 +141,8 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
     private function domainFor(string $kpiCode): string
     {
         return match ($kpiCode) {
-            'RL-VENDOR-ACTIVITY' => 'marketplace',
-            'RL-SALES', 'RL-REFUNDS' => 'marketplace',
+            'RL-VENDOR-ACTIVITY', 'RL-SALES', 'RL-REFUNDS' => 'marketplace',
+            'RL-SUBSCRIPTIONS' => 'subscription',
             default => 'learning',
         };
     }
@@ -157,6 +161,7 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
                 $client, $start, $end,
                 fn ($r) => in_array($r['type'] ?? null, self::ENROLLMENT_SALE_TYPES, true)
             ),
+            'RL-SUBSCRIPTIONS' => $this->salesCountAndSum($client, $start, $end, fn ($r) => ($r['payment_method'] ?? null) === 'subscribe'),
             'RL-ACTIVE-LEARNERS' => $this->activeLearners($client, $start, $end),
             'RL-VENDOR-ACTIVITY' => $this->vendorActivity($client, $start, $end),
             'RL-COURSE-COMPLETION' => $this->courseCompletion($client),

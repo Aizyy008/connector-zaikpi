@@ -170,15 +170,38 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertSame(60.0, $result->output['measurement']['value']['sum']);
     }
 
-    public function test_rocket_lms_pull_measurements_rejects_unconfirmed_kpi(): void
+    public function test_rocket_lms_pull_measurements_computes_subscriptions_kpi(): void
     {
-        // RL-SUBSCRIPTIONS deliberately excluded — installment mechanism not yet inspected.
+        Http::fake([
+            '*/api/development/panel/financial/sales*' => Http::response(['success' => true, 'data' => ['sales' => [
+                ['id' => 1, 'buyer_id' => 930, 'type' => 'webinar', 'payment_method' => 'subscribe', 'created_at' => strtotime('2026-08-05'), 'amount' => '0.00', 'total_amount' => '0.00', 'refund_at' => null],
+                ['id' => 2, 'buyer_id' => 931, 'type' => 'webinar', 'payment_method' => 'credit', 'created_at' => strtotime('2026-08-06'), 'amount' => '60.00', 'total_amount' => '60.00', 'refund_at' => null],
+            ]]], 200),
+        ]);
+
         $ws = $this->workspace();
         $connector = $this->connector($ws, 'rocket_lms', 'https://dctrd.us');
         $context = new ExecutionContext($ws, $connector);
 
         $result = (new PullRocketLmsMeasurementsAction())->execute([
             'kpi_code' => 'RL-SUBSCRIPTIONS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertTrue($result->success);
+        $this->assertSame(1, $result->output['measurement']['value']['count']);
+    }
+
+    public function test_rocket_lms_pull_measurements_rejects_unapproved_kpi(): void
+    {
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'rocket_lms', 'https://dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullRocketLmsMeasurementsAction())->execute([
+            'kpi_code' => 'RL-NOT-A-REAL-KPI',
             'tenant_uuid' => (string) Str::uuid(),
             'period_start' => '2026-08-01',
             'period_end' => '2026-08-31',
