@@ -11,22 +11,31 @@ use App\Support\KpiAdapters\AdapterEventEnvelope;
 use Illuminate\Support\Str;
 
 /**
- * Rocket LMS KPI adapter (Project 2, requirements doc Milestone 2). Pulls one period's
- * aggregated measurement for an approved KPI (see
- * project_2_v1_files/docs/03-rocket-lms-{audit,data-dictionary}.md).
+ * Rocket LMS KPI adapter (Project 2, requirements doc Milestone 4). Pulls one period's
+ * aggregated measurement for an approved KPI, per VENDOR (see
+ * project_2_v1_files/docs/03-rocket-lms-{audit,data-dictionary}.md §0).
  *
- * Deliberately covers only the 5 KPIs whose source endpoint is confirmed
- * (RL-ENROLLMENTS, RL-COURSE-COMPLETION, RL-ACTIVE-LEARNERS, RL-SALES, RL-VENDOR-ACTIVITY).
- * RL-REFUNDS and RL-SUBSCRIPTIONS are intentionally NOT implemented — no matching API route
- * was found for either during discovery; per the requirements doc's change-control rule
- * ("no source application is assumed to provide an endpoint... that has not been verified"),
- * they stay out of KPI_CODES until confirmed rather than guessed at.
+ * CONFIRMED live + from source, 2026-08-31: Rocket LMS's mobile API has no admin/global view —
+ * every endpoint only returns the authenticated user's own records. This adapter is therefore
+ * designed to run once PER CONNECTED VENDOR CREDENTIAL (one Connector = one vendor/teacher
+ * login), not once for the whole platform. `tenant_uuid` stays the client's tenant; the vendor
+ * identity travels in `source_entity_uuid` so ZaiKPI can tell one vendor's numbers apart from
+ * another's. See the data dictionary for the 3 options this design was chosen from (client
+ * decision: option 1 — per-vendor credentials, zero Rocket LMS source changes).
+ *
+ * All 6 KPIs below trace to a real, live-confirmed field — nothing guessed. `RL-SUBSCRIPTIONS`
+ * stays excluded (the `installment` mechanism hasn't been inspected yet — logged as an open
+ * obstruction, not silently dropped).
  */
 class PullRocketLmsMeasurementsAction extends AbstractModule
 {
     private const KPI_CODES = [
-        'RL-ENROLLMENTS', 'RL-COURSE-COMPLETION', 'RL-ACTIVE-LEARNERS', 'RL-SALES', 'RL-VENDOR-ACTIVITY',
+        'RL-SALES', 'RL-REFUNDS', 'RL-ENROLLMENTS',
+        'RL-ACTIVE-LEARNERS', 'RL-VENDOR-ACTIVITY', 'RL-COURSE-COMPLETION',
     ];
+
+    /** Sale types counted as an enrollment (excludes bookings/meetings). */
+    private const ENROLLMENT_SALE_TYPES = ['webinar', 'bundle'];
 
     public function slug(): string
     {
@@ -45,7 +54,7 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
 
     public function description(): string
     {
-        return 'Reads one aggregated KPI measurement (enrollments, sales, course completion, vendor activity) from Rocket LMS for a period, for delivery to ZaiKPI.';
+        return 'Reads one aggregated KPI measurement (sales, refunds, enrollments, active learners, course activity/completion) for one connected Rocket LMS vendor, for delivery to ZaiKPI.';
     }
 
     public function actions(): array
@@ -60,7 +69,6 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
             'tenant_uuid' => 'string',
             'period_start' => 'string',
             'period_end' => 'string',
-            'webinar_id' => 'string', // required only for RL-COURSE-COMPLETION
         ];
     }
 
@@ -90,24 +98,29 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
             }
         }
         if (! in_array($input['kpi_code'], self::KPI_CODES, true)) {
-            return ExecutionResult::fail("kpi_code '{$input['kpi_code']}' is not in the approved Rocket LMS KPI catalogue (or its source endpoint is unconfirmed — see 03-rocket-lms-audit.md).");
+            return ExecutionResult::fail("kpi_code '{$input['kpi_code']}' is not in the approved Rocket LMS KPI catalogue (or its source is unconfirmed — see 03-rocket-lms-data-dictionary.md).");
         }
-        if ($input['kpi_code'] === 'RL-COURSE-COMPLETION' && empty($input['webinar_id'])) {
-            return ExecutionResult::fail('webinar_id is required for RL-COURSE-COMPLETION.');
+
+        $start = strtotime($input['period_start']);
+        $end = strtotime($input['period_end']);
+        if ($start === false || $end === false) {
+            return ExecutionResult::fail('period_start/period_end must be parseable dates.');
         }
 
         $client = RocketLmsClient::forConnector($context->connector);
-        $value = $this->compute($client, $input);
+        $value = $this->compute($client, $input['kpi_code'], $start, $end);
 
         if ($value === null) {
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Rocket LMS API call did not succeed.");
         }
 
+        $vendorId = $context->connector->config['vendor_user_id'] ?? null;
+
         $fields = AdapterEventEnvelope::contractFields([
             'tenant_uuid' => $input['tenant_uuid'],
             'source_application' => 'rocket_lms',
-            'source_entity_type' => $input['kpi_code'] === 'RL-COURSE-COMPLETION' ? 'webinar' : null,
-            'source_entity_uuid' => $input['webinar_id'] ?? null,
+            'source_entity_type' => 'vendor',
+            'source_entity_uuid' => $vendorId !== null ? (string) $vendorId : null,
             'external_uuid' => (string) Str::uuid(),
             'kpi_namespace' => 'rocket_lms.' . $this->domainFor($input['kpi_code']),
             'kpi_code' => $input['kpi_code'],
@@ -124,71 +137,103 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
     private function domainFor(string $kpiCode): string
     {
         return match ($kpiCode) {
-            'RL-ENROLLMENTS', 'RL-COURSE-COMPLETION', 'RL-ACTIVE-LEARNERS' => 'learning',
-            default => 'marketplace',
+            'RL-VENDOR-ACTIVITY' => 'marketplace',
+            'RL-SALES', 'RL-REFUNDS' => 'marketplace',
+            default => 'learning',
         };
     }
 
     /**
-     * Field names are best-effort (id/status/created_at conventions) — not yet verified against
-     * a live response, per the class docblock. Returns null on any API failure.
+     * Field names CONFIRMED 2026-08-31 from live authenticated responses (see the data
+     * dictionary §2) — not guesses. `created_at`/`refund_at` on sale rows are UNIX timestamps,
+     * not ISO strings — compared against $start/$end already converted via strtotime().
      */
-    private function compute(RocketLmsClient $client, array $input): ?array
+    private function compute(RocketLmsClient $client, string $kpiCode, int $start, int $end): ?array
     {
-        $start = $input['period_start'];
-        $end = $input['period_end'];
-
-        return match ($input['kpi_code']) {
-            'RL-ENROLLMENTS' => $this->countInPeriod($client->purchases(), 'created_at', $start, $end),
-            'RL-ACTIVE-LEARNERS' => $this->distinctUsersInPeriod($client->purchases(), 'created_at', $start, $end),
-            'RL-SALES' => $this->countAndSum($client->sales(), 'created_at', 'total', $start, $end),
-            'RL-VENDOR-ACTIVITY' => $this->countInPeriod($client->instructorCourses(), 'created_at', $start, $end),
-            'RL-COURSE-COMPLETION' => $this->completionFromStatistic($client, $input['webinar_id']),
+        return match ($kpiCode) {
+            'RL-SALES' => $this->salesCountAndSum($client, $start, $end, fn () => true),
+            'RL-REFUNDS' => $this->salesCountAndSum($client, $start, $end, fn ($r) => ! empty($r['refund_at'])),
+            'RL-ENROLLMENTS' => $this->salesCountAndSum(
+                $client, $start, $end,
+                fn ($r) => in_array($r['type'] ?? null, self::ENROLLMENT_SALE_TYPES, true)
+            ),
+            'RL-ACTIVE-LEARNERS' => $this->activeLearners($client, $start, $end),
+            'RL-VENDOR-ACTIVITY' => $this->vendorActivity($client, $start, $end),
+            'RL-COURSE-COMPLETION' => $this->courseCompletion($client),
             default => null,
         };
     }
 
-    private function countInPeriod(array $result, string $dateField, string $start, string $end): ?array
+    private function salesRowsInPeriod(RocketLmsClient $client, int $start, int $end): ?\Illuminate\Support\Collection
     {
+        $result = $client->sales();
         if (! $result['ok']) {
             return null;
         }
-        $rows = collect($result['data'])->filter(fn ($r) => isset($r[$dateField]) && $r[$dateField] >= $start && $r[$dateField] <= $end);
+
+        return collect($result['data'])->filter(
+            fn ($r) => isset($r['created_at']) && $r['created_at'] >= $start && $r['created_at'] <= $end
+        );
+    }
+
+    private function salesCountAndSum(RocketLmsClient $client, int $start, int $end, callable $predicate): ?array
+    {
+        $rows = $this->salesRowsInPeriod($client, $start, $end);
+        if ($rows === null) {
+            return null;
+        }
+        $matched = $rows->filter($predicate);
+
+        return ['count' => $matched->count(), 'sum' => (float) $matched->sum(fn ($r) => (float) ($r['total_amount'] ?? $r['amount'] ?? 0))];
+    }
+
+    private function activeLearners(RocketLmsClient $client, int $start, int $end): ?array
+    {
+        $rows = $this->salesRowsInPeriod($client, $start, $end);
+        if ($rows === null) {
+            return null;
+        }
+
+        return ['count' => $rows->pluck('buyer_id')->filter()->unique()->count()];
+    }
+
+    private function vendorActivity(RocketLmsClient $client, int $start, int $end): ?array
+    {
+        $result = $client->myClasses();
+        if (! $result['ok']) {
+            return null;
+        }
+        $rows = collect($result['data'])->filter(
+            fn ($r) => isset($r['created_at']) && $r['created_at'] >= $start && $r['created_at'] <= $end
+        );
 
         return ['count' => $rows->count()];
     }
 
-    private function distinctUsersInPeriod(array $result, string $dateField, string $start, string $end): ?array
+    /**
+     * Average `course_progress` (confirmed field, WebinarResource statistic-mode block) across
+     * this vendor's own courses. One statistic call per course — acceptable for a per-vendor
+     * course list, which is expected to be small.
+     */
+    private function courseCompletion(RocketLmsClient $client): ?array
     {
-        if (! $result['ok']) {
+        $classes = $client->myClasses();
+        if (! $classes['ok']) {
             return null;
         }
-        $rows = collect($result['data'])->filter(fn ($r) => isset($r[$dateField]) && $r[$dateField] >= $start && $r[$dateField] <= $end);
-
-        return ['count' => $rows->pluck('user_id')->unique()->count()];
-    }
-
-    private function countAndSum(array $result, string $dateField, string $sumField, string $start, string $end): ?array
-    {
-        if (! $result['ok']) {
-            return null;
+        $ids = collect($classes['data'])->pluck('id')->filter();
+        if ($ids->isEmpty()) {
+            return ['courses' => 0, 'average_progress' => null];
         }
-        $rows = collect($result['data'])->filter(fn ($r) => isset($r[$dateField]) && $r[$dateField] >= $start && $r[$dateField] <= $end);
 
-        return ['count' => $rows->count(), 'sum' => (float) $rows->sum($sumField)];
-    }
-
-    private function completionFromStatistic(RocketLmsClient $client, string $webinarId): ?array
-    {
-        $result = $client->webinarStatistic($webinarId);
-        if (! $result['ok']) {
-            return null;
-        }
-        $data = $result['data'];
+        $progresses = $ids->map(function ($id) use ($client) {
+            $stat = $client->webinarStatistic((int) $id);
+            return $stat['ok'] ? ($stat['data']['course_progress'] ?? null) : null;
+        })->filter(fn ($p) => is_numeric($p));
 
         return [
-            'enrolled' => $data['enrolled_count'] ?? $data['students_count'] ?? null,
-            'completed' => $data['completed_count'] ?? null,
+            'courses' => $ids->count(),
+            'average_progress' => $progresses->isEmpty() ? null : round($progresses->avg(), 2),
         ];
     }
 }
