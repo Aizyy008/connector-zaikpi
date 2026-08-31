@@ -25,8 +25,9 @@ use Illuminate\Support\Str;
 class PullPerfexCrmMeasurementsAction extends AbstractModule
 {
     /** Approved catalogue (04-perfex-crm-data-dictionary.md §2) — no KPI outside this list. */
+    /** PX-LEAD-CONVERSION deliberately excluded — see compute()'s docblock. */
     private const KPI_CODES = [
-        'PX-LEADS', 'PX-LEAD-CONVERSION', 'PX-INVOICES', 'PX-COLLECTIONS',
+        'PX-LEADS', 'PX-INVOICES', 'PX-COLLECTIONS',
         'PX-OUTSTANDING-BALANCE', 'PX-PROJECT-COMPLETION', 'PX-TASK-STATUS', 'PX-OVERDUE-WORK',
     ];
 
@@ -128,21 +129,36 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
     }
 
     /**
-     * Field names are best-effort from Perfex CRM's public schema (id/status/total/dateadded
-     * conventions) — see the class docblock. Returns null on any API failure; never guesses a
-     * value from a failed call.
+     * Field names and status codes CONFIRMED 2026-08-31 from the live install's own source
+     * (application/models/{Invoices_model,Tasks_model}.php status constants, and
+     * Projects_model::get_project_statuses() cross-referenced against
+     * language/english/english_lang.php) — not guesses. See 04-perfex-crm-audit.md.
+     *
+     * Invoice status: 1=Unpaid, 2=Paid, 3=Partially paid (Invoices_model::STATUS_*).
+     * Task status: 1=Not started, 2=Awaiting feedback, 3=Testing, 4=In progress, 5=Complete
+     * (Tasks_model::STATUS_*).
+     * Project status: 1..5, id 4 = "Finished" (language key project_status_4).
+     *
+     * PX-LEAD-CONVERSION is NOT implemented — Perfex converts a lead by moving it into a
+     * separate `clients` table entirely, not via a status value on the lead record itself, so
+     * this can't be computed from GET /api/leads alone. Documented as a real obstruction rather
+     * than guessed at; excluded from KPI_CODES above until a proper cross-table definition is
+     * agreed with the client.
      */
+    private const INVOICE_STATUS_PAID = 2;
+    private const TASK_STATUS_COMPLETE = 5;
+    private const PROJECT_STATUS_FINISHED = 4;
+
     private function compute(PerfexCrmClient $client, string $kpiCode, string $start, string $end): ?array
     {
         return match ($kpiCode) {
             'PX-LEADS' => $this->countInPeriod($client, 'leads', 'dateadded', $start, $end),
-            'PX-LEAD-CONVERSION' => $this->rate($client, 'leads', 'dateadded', $start, $end, fn ($r) => ($r['status'] ?? null) === 'converted'),
             'PX-INVOICES' => $this->countAndSum($client, 'invoices', 'date', 'total', $start, $end),
             'PX-COLLECTIONS' => $this->countAndSum($client, 'payments', 'date', 'amount', $start, $end),
-            'PX-OUTSTANDING-BALANCE' => $this->sumWhere($client, 'invoices', fn ($r) => (($r['status'] ?? null) !== 'paid'), 'total'),
-            'PX-PROJECT-COMPLETION' => $this->rate($client, 'projects', null, $start, $end, fn ($r) => ($r['status'] ?? null) === 'finished'),
+            'PX-OUTSTANDING-BALANCE' => $this->sumWhere($client, 'invoices', fn ($r) => (int) ($r['status'] ?? 0) !== self::INVOICE_STATUS_PAID, 'total'),
+            'PX-PROJECT-COMPLETION' => $this->rate($client, 'projects', null, $start, $end, fn ($r) => (int) ($r['status'] ?? 0) === self::PROJECT_STATUS_FINISHED),
             'PX-TASK-STATUS' => $this->breakdown($client, 'tasks', 'status'),
-            'PX-OVERDUE-WORK' => $this->countWhere($client, 'tasks', fn ($r) => ! empty($r['duedate']) && $r['duedate'] < $end && ($r['status'] ?? null) !== 'complete'),
+            'PX-OVERDUE-WORK' => $this->countWhere($client, 'tasks', fn ($r) => ! empty($r['duedate']) && $r['duedate'] < $end && (int) ($r['status'] ?? 0) !== self::TASK_STATUS_COMPLETE),
             default => null,
         };
     }
