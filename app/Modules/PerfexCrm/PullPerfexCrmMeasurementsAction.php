@@ -13,11 +13,8 @@ use Illuminate\Support\Str;
 /**
  * Perfex CRM KPI adapter (Project 2, requirements doc Milestone 3). Pulls one period's
  * aggregated measurement for an approved KPI from `modules/api` (see
- * project_2_v1_files/docs/04-perfex-crm-{audit,data-dictionary}.md — every field name below
- * is BEST-EFFORT from Perfex CRM's known public schema, NOT yet verified against a live
- * response from this specific install; verify against one real authenticated call before
- * this adapter is considered done, per the requirements doc's "no endpoint/field assumed
- * without verifying in staging" rule).
+ * project_2_v1_files/docs/04-perfex-crm-{audit,data-dictionary}.md — field names/status codes
+ * are CONFIRMED from the live install's own source, not guessed).
  *
  * Scope: read-only, aggregated measurements only — no source-side code, no raw record sync,
  * matching this adapter's "pure Connector-side module" decision in the audit doc.
@@ -25,9 +22,8 @@ use Illuminate\Support\Str;
 class PullPerfexCrmMeasurementsAction extends AbstractModule
 {
     /** Approved catalogue (04-perfex-crm-data-dictionary.md §2) — no KPI outside this list. */
-    /** PX-LEAD-CONVERSION deliberately excluded — see compute()'s docblock. */
     private const KPI_CODES = [
-        'PX-LEADS', 'PX-INVOICES', 'PX-COLLECTIONS',
+        'PX-LEADS', 'PX-LEAD-CONVERSION', 'PX-INVOICES', 'PX-COLLECTIONS',
         'PX-OUTSTANDING-BALANCE', 'PX-PROJECT-COMPLETION', 'PX-TASK-STATUS', 'PX-OVERDUE-WORK',
     ];
 
@@ -139,11 +135,13 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
      * (Tasks_model::STATUS_*).
      * Project status: 1..5, id 4 = "Finished" (language key project_status_4).
      *
-     * PX-LEAD-CONVERSION is NOT implemented — Perfex converts a lead by moving it into a
-     * separate `clients` table entirely, not via a status value on the lead record itself, so
-     * this can't be computed from GET /api/leads alone. Documented as a real obstruction rather
-     * than guessed at; excluded from KPI_CODES above until a proper cross-table definition is
-     * agreed with the client.
+     * PX-LEAD-CONVERSION resolved 2026-08-31 per the client's own definition ("converted when
+     * moved into a Customer through Perfex's standard lead conversion process") — read from
+     * `application/controllers/admin/Leads.php::convert_to_customer()`: the real conversion
+     * action does `UPDATE leads SET date_converted = NOW(), ...` on the lead row itself.
+     * `Leads_model::get()` selects `*` from `leads`, so `date_converted` is already present in
+     * every `GET /api/leads` response — no new endpoint, reuses countInPeriod() exactly like
+     * PX-LEADS (isset() on a null `date_converted` already excludes non-converted leads).
      */
     private const INVOICE_STATUS_PAID = 2;
     private const TASK_STATUS_COMPLETE = 5;
@@ -153,6 +151,7 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
     {
         return match ($kpiCode) {
             'PX-LEADS' => $this->countInPeriod($client, 'leads', 'dateadded', $start, $end),
+            'PX-LEAD-CONVERSION' => $this->countInPeriod($client, 'leads', 'date_converted', $start, $end),
             'PX-INVOICES' => $this->countAndSum($client, 'invoices', 'date', 'total', $start, $end),
             'PX-COLLECTIONS' => $this->countAndSum($client, 'payments', 'date', 'amount', $start, $end),
             'PX-OUTSTANDING-BALANCE' => $this->sumWhere($client, 'invoices', fn ($r) => (int) ($r['status'] ?? 0) !== self::INVOICE_STATUS_PAID, 'total'),

@@ -79,6 +79,32 @@ class Project2AdapterExecutionTest extends TestCase
         });
     }
 
+    public function test_perfex_pull_measurements_computes_lead_conversion_kpi(): void
+    {
+        Http::fake([
+            '*/api/leads*' => Http::response(['result' => [
+                ['id' => 1, 'dateadded' => '2026-07-20', 'date_converted' => '2026-08-05 10:00:00'],
+                ['id' => 2, 'dateadded' => '2026-08-02', 'date_converted' => '2026-08-15 09:00:00'],
+                ['id' => 3, 'dateadded' => '2026-08-10', 'date_converted' => null], // not converted
+                ['id' => 4, 'dateadded' => '2026-06-01', 'date_converted' => '2026-07-01 10:00:00'], // converted outside period
+            ]], 200),
+        ]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'perfex_crm', 'https://dctrd.us/_ERP');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullPerfexCrmMeasurementsAction())->execute([
+            'kpi_code' => 'PX-LEAD-CONVERSION',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertTrue($result->success);
+        $this->assertSame(2, $result->output['measurement']['value']['count']);
+    }
+
     public function test_perfex_pull_measurements_rejects_unapproved_kpi_code(): void
     {
         $ws = $this->workspace();
