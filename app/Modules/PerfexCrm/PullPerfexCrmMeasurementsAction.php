@@ -109,6 +109,11 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
             'period_start' => $input['period_start'],
             'period_end' => $input['period_end'],
             'measured_at' => now()->toIso8601String(),
+            // Inherits an inbound correlation id when the caller supplies one (e.g. a future
+            // ExecutionJob.correlation_id threaded through ExecutionContext::$meta), so a trace
+            // can survive source → Connector → ZaiKPI. Falls back to a fresh id otherwise —
+            // see AdapterEventEnvelope::contractFields()'s own default.
+            'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
         return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);

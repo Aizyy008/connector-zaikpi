@@ -132,6 +132,9 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
             'period_start' => $input['period_start'],
             'period_end' => $input['period_end'],
             'measured_at' => now()->toIso8601String(),
+            // Inherits an inbound correlation id when supplied via ExecutionContext::$meta —
+            // see PullPerfexCrmMeasurementsAction for the full rationale.
+            'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
         return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);
