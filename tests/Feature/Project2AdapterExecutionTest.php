@@ -323,10 +323,8 @@ class Project2AdapterExecutionTest extends TestCase
     public function test_tour_guide_pull_measurements_computes_completion_rate_kpi(): void
     {
         Http::fake([
-            '*/v1/content*' => Http::response(['results' => [
-                ['id' => 'content-1', 'object' => 'content'],
-                ['id' => 'content-2', 'object' => 'content'],
-            ], 'next' => null, 'previous' => null], 200),
+            // More specific pattern MUST come first — Http::fake() uses first-match-wins, and
+            // '*/v1/content*' would otherwise also match '/v1/content-sessions...' requests.
             '*/v1/content-sessions*' => function ($request) {
                 parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
                 $contentId = $query['contentId'] ?? null;
@@ -343,6 +341,10 @@ class Project2AdapterExecutionTest extends TestCase
                     default => [],
                 }, 'next' => null, 'previous' => null], 200);
             },
+            '*/v1/content*' => Http::response(['results' => [
+                ['id' => 'content-1', 'object' => 'content'],
+                ['id' => 'content-2', 'object' => 'content'],
+            ], 'next' => null, 'previous' => null], 200),
         ]);
 
         $ws = $this->workspace();
