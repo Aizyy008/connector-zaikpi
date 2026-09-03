@@ -9,15 +9,16 @@ use App\Modules\ExecutionContext;
 use App\Modules\MiroTalk\PullMiroTalkMeasurementsAction;
 use App\Modules\PerfexCrm\PullPerfexCrmMeasurementsAction;
 use App\Modules\RocketLms\PullRocketLmsMeasurementsAction;
+use App\Modules\TourGuide\PullTourGuideMeasurementsAction;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
- * Project 2 KPI adapters — Perfex CRM and Rocket LMS Pull actions. Mirrors ExecutionTest.php's
- * conventions (Http::fake() rather than a live call, since no real credential exists yet for
- * either app — see project_2_v1_files/docs/{03,04}-*-audit.md).
+ * Project 2 KPI adapters — Perfex CRM, Rocket LMS, Tour Guide and MiroTalk Pull actions.
+ * Mirrors ExecutionTest.php's conventions (Http::fake() against real, confirmed response
+ * shapes — see project_2_v1_files/docs/0{1,2,3,4,5}-*.md for how each shape was verified).
  */
 class Project2AdapterExecutionTest extends TestCase
 {
@@ -310,6 +311,66 @@ class Project2AdapterExecutionTest extends TestCase
 
         $result = (new PullMiroTalkMeasurementsAction())->execute([
             'kpi_code' => 'MT-NOT-A-REAL-KPI',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('not in the approved', $result->error);
+    }
+
+    public function test_tour_guide_pull_measurements_computes_completion_rate_kpi(): void
+    {
+        Http::fake([
+            '*/v1/content*' => Http::response(['results' => [
+                ['id' => 'content-1', 'object' => 'content'],
+                ['id' => 'content-2', 'object' => 'content'],
+            ], 'next' => null, 'previous' => null], 200),
+            '*/v1/content-sessions*' => function ($request) {
+                parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
+                $contentId = $query['contentId'] ?? null;
+
+                return Http::response(['results' => match ($contentId) {
+                    'content-1' => [
+                        ['id' => 's1', 'contentId' => 'content-1', 'userId' => 'u1', 'completed' => true, 'createdAt' => '2026-08-05T00:00:00Z'],
+                        ['id' => 's2', 'contentId' => 'content-1', 'userId' => 'u2', 'completed' => false, 'createdAt' => '2026-08-06T00:00:00Z'],
+                    ],
+                    'content-2' => [
+                        ['id' => 's3', 'contentId' => 'content-2', 'userId' => 'u1', 'completed' => true, 'createdAt' => '2026-08-07T00:00:00Z'],
+                        ['id' => 's4', 'contentId' => 'content-2', 'userId' => 'u3', 'completed' => false, 'createdAt' => '2026-07-01T00:00:00Z'], // outside period
+                    ],
+                    default => [],
+                }, 'next' => null, 'previous' => null], 200);
+            },
+        ]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'tour_guide', 'https://usertour.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullTourGuideMeasurementsAction())->execute([
+            'kpi_code' => 'TG-COMPLETION-RATE',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01T00:00:00Z',
+            'period_end' => '2026-08-31T23:59:59Z',
+        ], $context);
+
+        $this->assertTrue($result->success);
+        $this->assertSame(3, $result->output['measurement']['value']['total']);
+        $this->assertSame(2, $result->output['measurement']['value']['completed']);
+
+        Http::assertSent(fn ($request) => $request->hasHeader('Authorization', 'Bearer test-token'));
+    }
+
+    public function test_tour_guide_pull_measurements_rejects_unapproved_kpi(): void
+    {
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'tour_guide', 'https://usertour.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullTourGuideMeasurementsAction())->execute([
+            'kpi_code' => 'TG-CHECKLIST-PROGRESS',
             'tenant_uuid' => (string) Str::uuid(),
             'period_start' => '2026-08-01',
             'period_end' => '2026-08-31',

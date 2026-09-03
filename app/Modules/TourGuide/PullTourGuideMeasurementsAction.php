@@ -8,19 +8,27 @@ use App\Modules\ExecutionResult;
 use App\Modules\ModuleHealth;
 use App\Services\TourGuide\TourGuideClient;
 use App\Support\KpiAdapters\AdapterEventEnvelope;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 
 /**
  * Tour Guide (Usertour) KPI adapter (Project 2, requirements doc Milestone 5). Pulls one
- * period's aggregated measurement for an approved KPI, all from one `content-sessions` pull
- * (see project_2_v1_files/docs/{01,02,06}-tour-guide-*.md).
+ * period's aggregated measurement for an approved KPI, across ALL content (guides/tours) —
+ * `GET /v1/content-sessions` requires a `contentId` per call (confirmed live), so this pulls
+ * `content` first, then sessions per content id, then aggregates.
  *
- * Deliberately covers only the 4 KPIs whose source field is confirmed
- * (TG-GUIDE-STARTS, TG-GUIDE-COMPLETIONS, TG-COMPLETION-RATE, TG-FEATURE-ADOPTION).
- * TG-CHECKLIST-PROGRESS, TG-STEP-DROPOFF and TG-GUIDE-ERRORS are intentionally NOT implemented —
- * no matching field found in the path-only OpenAPI spec; per the requirements doc's change-
- * control rule, they stay out of KPI_CODES until confirmed against a real response rather than
- * guessed at.
+ * Field names CONFIRMED 2026-09-03 from the live OpenAPI schema (`ContentSession` component) —
+ * real fields are camelCase, NOT the snake_case originally guessed: `completed` (boolean),
+ * `createdAt`, `userId`, `contentId`, `progress`. List responses use `{results: [...]}`, not
+ * `{data: [...]}`.
+ *
+ * TG-CHECKLIST-PROGRESS, TG-STEP-DROPOFF and TG-GUIDE-ERRORS remain intentionally NOT
+ * implemented — confirmed (not just guessed) there is no way to build them: `event-definitions`
+ * only lists event TYPES (e.g. `checklist_completed`, `flow_step_seen`, `tooltip_target_missing`
+ * all genuinely exist as concepts), but there is no endpoint anywhere in the API that returns
+ * actual event OCCURRENCES, and `ContentSession` itself has no embedded events array. Checked
+ * thoroughly via the full OpenAPI schema, not just the path list — this is a confirmed "no",
+ * not a gap left from not looking.
  */
 class PullTourGuideMeasurementsAction extends AbstractModule
 {
@@ -94,11 +102,12 @@ class PullTourGuideMeasurementsAction extends AbstractModule
         }
 
         $client = TourGuideClient::forConnector($context->connector);
-        $value = $this->compute($client, $input);
-
-        if ($value === null) {
+        $sessions = $this->collectSessions($client, $input);
+        if ($sessions === null) {
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Tour Guide API call did not succeed.");
         }
+
+        $value = $this->compute($input['kpi_code'], $sessions, $input);
 
         $fields = AdapterEventEnvelope::contractFields([
             'tenant_uuid' => $input['tenant_uuid'],
@@ -118,34 +127,48 @@ class PullTourGuideMeasurementsAction extends AbstractModule
     }
 
     /**
-     * Field names are best-effort (id/content_id/user_id/created_at/ended_at conventions) — not
-     * yet verified against a live response, per the class docblock. Returns null on any API
-     * failure.
+     * `content-sessions` requires a contentId per call, so pull `content` first (or use the
+     * caller-supplied content_id to skip that lookup), then sessions per content id, merged.
      */
-    private function compute(TourGuideClient $client, array $input): ?array
+    private function collectSessions(TourGuideClient $client, array $input): ?Collection
     {
-        $result = $client->listContentSessions();
-        if (! $result['ok']) {
-            return null;
-        }
-        $rows = collect($result['data'])->filter(
-            fn ($r) => isset($r['created_at']) && $r['created_at'] >= $input['period_start'] && $r['created_at'] <= $input['period_end']
-        );
         if (! empty($input['content_id'])) {
-            $rows = $rows->filter(fn ($r) => ($r['content_id'] ?? null) === $input['content_id']);
+            $contentIds = collect([$input['content_id']]);
+        } else {
+            $contentResult = $client->listContent();
+            if (! $contentResult['ok']) {
+                return null;
+            }
+            $contentIds = collect($contentResult['data'])->pluck('id')->filter();
         }
-        $completed = $rows->filter(fn ($r) => ! empty($r['ended_at']));
 
-        return match ($input['kpi_code']) {
-            'TG-GUIDE-STARTS' => ['count' => $rows->count()],
+        $sessions = collect();
+        foreach ($contentIds as $contentId) {
+            $result = $client->listContentSessions((string) $contentId);
+            if (! $result['ok']) {
+                return null;
+            }
+            $sessions = $sessions->merge($result['data']);
+        }
+
+        return $sessions->filter(
+            fn ($r) => isset($r['createdAt']) && $r['createdAt'] >= $input['period_start'] && $r['createdAt'] <= $input['period_end']
+        );
+    }
+
+    private function compute(string $kpiCode, Collection $sessions, array $input): array
+    {
+        $completed = $sessions->filter(fn ($r) => ! empty($r['completed']));
+
+        return match ($kpiCode) {
+            'TG-GUIDE-STARTS' => ['count' => $sessions->count()],
             'TG-GUIDE-COMPLETIONS' => ['count' => $completed->count()],
             'TG-COMPLETION-RATE' => [
-                'total' => $rows->count(),
+                'total' => $sessions->count(),
                 'completed' => $completed->count(),
-                'rate' => $rows->count() > 0 ? round($completed->count() / $rows->count(), 4) : null,
+                'rate' => $sessions->count() > 0 ? round($completed->count() / $sessions->count(), 4) : null,
             ],
-            'TG-FEATURE-ADOPTION' => ['count' => $completed->pluck('user_id')->unique()->count()],
-            default => null,
+            'TG-FEATURE-ADOPTION' => ['count' => $completed->pluck('userId')->filter()->unique()->count()],
         };
     }
 }

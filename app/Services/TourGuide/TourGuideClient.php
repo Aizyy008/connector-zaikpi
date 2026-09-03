@@ -9,12 +9,13 @@ use Illuminate\Support\Facades\Http;
 /**
  * Thin client for the Tour Guide (Usertour) REST API. Mirrors ZaiKpiClient's shape.
  *
- * Confirmed 2026-08-29: genuinely self-hosted (Usertour v0.9.0, Docker), Bearer/JWT auth per its
- * OpenAPI spec, no webhook capability anywhere in its deployment docs — this is a poll-only
- * adapter (no EventTrigger module). See project_2_v1_files/docs/01-tour-guide-audit.md.
- *
- * Pagination/date-filter query params on GET /v1/content-sessions are NOT confirmed against a
- * live response yet (no token available) — verify before this adapter is considered done.
+ * CONFIRMED live 2026-09-03 (real API key, see project_2_v1_files/docs/02-tour-guide-data-
+ * dictionary.md): Bearer auth confirmed working, base path `/v1`. List responses use
+ * `{results: [...], next, previous}` — NOT `{data: [...]}` as originally guessed.
+ * `GET /v1/content-sessions` REQUIRES a `contentId` query param (confirmed live —
+ * `{"error":{"code":"E1017","message":"contentId should not be empty"}}` without one) — it is
+ * NOT a global pull like the original draft of this client assumed. This client therefore lists
+ * `content` first, then the action pulls sessions per content id.
  */
 class TourGuideClient
 {
@@ -47,15 +48,20 @@ class TourGuideClient
         return ['ok' => $r->successful(), 'status' => $r->status(), 'body' => $r->json()];
     }
 
-    /**
-     * List content (tour/flow) sessions for a period — the single source pull that
-     * TG-GUIDE-STARTS, TG-GUIDE-COMPLETIONS, TG-COMPLETION-RATE and TG-FEATURE-ADOPTION are all
-     * aggregated from.
-     */
-    public function listContentSessions(array $query = []): array
+    /** All content (guides/tours/checklists) — the id list content-sessions is pulled per. */
+    public function listContent(): array
     {
-        $r = $this->http()->get('content-sessions', $query);
-        return $this->result($r);
+        return $this->result($this->http()->get('content'));
+    }
+
+    /**
+     * Sessions for ONE content item — TG-GUIDE-STARTS, TG-GUIDE-COMPLETIONS,
+     * TG-COMPLETION-RATE and TG-FEATURE-ADOPTION are all aggregated from this, across every
+     * content id (confirmed live: this endpoint requires contentId, it's not a global pull).
+     */
+    public function listContentSessions(string $contentId): array
+    {
+        return $this->result($this->http()->get('content-sessions', ['contentId' => $contentId]));
     }
 
     private function result($response): array
@@ -63,7 +69,7 @@ class TourGuideClient
         return [
             'ok' => $response->successful(),
             'status' => $response->status(),
-            'data' => $response->json('data') ?? $response->json() ?? [],
+            'data' => $response->json('results') ?? [],
             'error' => $response->successful() ? null : ($response->json('message') ?? 'request_failed'),
         ];
     }
