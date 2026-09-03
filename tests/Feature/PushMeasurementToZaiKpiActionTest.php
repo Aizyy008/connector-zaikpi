@@ -77,7 +77,7 @@ class PushMeasurementToZaiKpiActionTest extends TestCase
             'measurement' => $this->measurement(),
         ], $context);
 
-        $this->assertTrue($result->success, $result->error);
+        $this->assertTrue($result->success, (string) $result->error);
         $this->assertSame('zk-kpi-uuid-1', $result->output['zaikpi_kpi_uuid']);
         $this->assertSame('zk-measurement-uuid-1', $result->output['zaikpi_measurement_uuid']);
 
