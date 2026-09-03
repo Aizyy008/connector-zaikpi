@@ -63,11 +63,17 @@ class PerfexCrmClient
 
     private function result($response): array
     {
+        // Confirmed live behavior (not a guess): this REST API returns HTTP 404 with
+        // {"status":false,"message":"No data were found"} for a genuinely empty list — not an
+        // error. Treat that specific shape as a successful empty result; any other non-2xx is a
+        // real failure.
+        $isEmptyNotFound = $response->status() === 404 && $response->json('message') === 'No data were found';
+
         return [
-            'ok' => $response->successful(),
+            'ok' => $response->successful() || $isEmptyNotFound,
             'status' => $response->status(),
-            'data' => $response->json('result') ?? $response->json() ?? [],
-            'error' => $response->successful() ? null : ($response->json('error') ?? 'request_failed'),
+            'data' => $isEmptyNotFound ? [] : ($response->json('result') ?? $response->json() ?? []),
+            'error' => ($response->successful() || $isEmptyNotFound) ? null : ($response->json('error') ?? 'request_failed'),
         ];
     }
 }
