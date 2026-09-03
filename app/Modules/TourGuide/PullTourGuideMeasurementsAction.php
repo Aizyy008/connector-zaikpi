@@ -126,7 +126,21 @@ class PullTourGuideMeasurementsAction extends AbstractModule
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);
+        // See PullPerfexCrmMeasurementsAction's execute() for why this exists.
+        $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+
+        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+    }
+
+    private function primaryValueFor(string $kpiCode, array $value): ?float
+    {
+        $key = match ($kpiCode) {
+            'TG-GUIDE-STARTS', 'TG-GUIDE-COMPLETIONS', 'TG-FEATURE-ADOPTION' => 'count',
+            'TG-COMPLETION-RATE' => 'rate',
+            default => null,
+        };
+
+        return $key !== null && isset($value[$key]) ? (float) $value[$key] : null;
     }
 
     /**

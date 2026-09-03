@@ -120,6 +120,9 @@ class PullMiroTalkMeasurementsAction extends AbstractModule
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);
+        // See PullPerfexCrmMeasurementsAction's execute() for why this exists.
+        $primaryValue = isset($value['count']) ? (float) $value['count'] : null;
+
+        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
     }
 }

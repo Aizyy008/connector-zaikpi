@@ -9,6 +9,7 @@ use App\Modules\RocketLms\PullRocketLmsMeasurementsAction;
 use App\Modules\TourGuide\PullTourGuideMeasurementsAction;
 use App\Modules\ZaiKpi\PullMeasurementsAction;
 use App\Modules\ZaiKpi\PushKpiDefinitionAction;
+use App\Modules\ZaiKpi\PushMeasurementToZaiKpiAction;
 use App\Modules\ZaiKpi\ZaiKpiEventTrigger;
 
 return [
@@ -33,6 +34,7 @@ return [
         PushKpiDefinitionAction::class,   // inbound  FlinkISO → ZaiKPI
         PullMeasurementsAction::class,    // outbound ZaiKPI → FlinkISO
         ZaiKpiEventTrigger::class,        // outbound events via webhook intake
+        PushMeasurementToZaiKpiAction::class, // inbound Project 2 adapters → ZaiKPI
 
         // Project 2 — KPI Adapters (see project_2_v1_files/docs/07-modification-register.md)
         PullPerfexCrmMeasurementsAction::class,

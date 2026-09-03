@@ -116,7 +116,28 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);
+        // `primary_value` is the single number PushMeasurementToZaiKpiAction sends as ZaiKPI's
+        // `measured_value` (ZaiKPI tracks one scored number per KPI per period, not a breakdown
+        // object). Chosen per the unit already documented in 04-perfex-crm-data-dictionary.md §2.
+        // PX-TASK-STATUS is deliberately null — it's a status distribution, not a single
+        // trackable value; it's still computed and returned for Connector-side visibility, just
+        // not pushed to ZaiKPI as-is (see 07-modification-register.md).
+        $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+
+        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+    }
+
+    private function primaryValueFor(string $kpiCode, array $value): ?float
+    {
+        $key = match ($kpiCode) {
+            'PX-LEADS', 'PX-LEAD-CONVERSION', 'PX-OVERDUE-WORK' => 'count',
+            'PX-INVOICES', 'PX-COLLECTIONS', 'PX-OUTSTANDING-BALANCE' => 'sum',
+            'PX-PROJECT-COMPLETION' => 'rate',
+            'PX-TASK-STATUS' => null,
+            default => null,
+        };
+
+        return $key !== null && isset($value[$key]) ? (float) $value[$key] : null;
     }
 
     /** Domain per 04-perfex-crm-data-dictionary.md §1. */

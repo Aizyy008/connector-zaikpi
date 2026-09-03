@@ -118,7 +118,25 @@ class PullLeadHubMeasurementsAction extends AbstractModule
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);
+        // See PullPerfexCrmMeasurementsAction's execute() for why this exists. LH-WON-LOST's
+        // primary is `won` (the actionable positive outcome) — `lost` stays in the full value
+        // breakdown for context.
+        $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+
+        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+    }
+
+    private function primaryValueFor(string $kpiCode, array $value): ?float
+    {
+        $key = match ($kpiCode) {
+            'LH-NEW-LEADS', 'LH-QUALIFIED-LEADS' => 'count',
+            'LH-WON-LOST' => 'won',
+            'LH-RESPONSE-TIME' => 'average_hours',
+            'LH-STAGE-CONVERSION' => 'rate',
+            default => null,
+        };
+
+        return $key !== null && isset($value[$key]) ? (float) $value[$key] : null;
     }
 
     private function compute(LeadHubClient $client, string $kpiCode, string $start, string $end): ?array

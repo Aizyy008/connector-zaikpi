@@ -137,7 +137,22 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value]]);
+        // See PullPerfexCrmMeasurementsAction's execute() for why this exists.
+        $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+
+        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+    }
+
+    private function primaryValueFor(string $kpiCode, array $value): ?float
+    {
+        $key = match ($kpiCode) {
+            'RL-SALES', 'RL-REFUNDS' => 'sum',
+            'RL-ENROLLMENTS', 'RL-SUBSCRIPTIONS', 'RL-ACTIVE-LEARNERS', 'RL-VENDOR-ACTIVITY' => 'count',
+            'RL-COURSE-COMPLETION' => 'average_progress',
+            default => null,
+        };
+
+        return $key !== null && isset($value[$key]) ? (float) $value[$key] : null;
     }
 
     /** Domain per 03-rocket-lms-data-dictionary.md §1. */

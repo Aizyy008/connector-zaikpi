@@ -58,6 +58,43 @@ class ZaiKpiClient
         return $this->result($r);
     }
 
+    /**
+     * Inbound (Project 2): find the ZaiKPI-side KPI definition for a source-aware adapter's
+     * kpi_code, so its measurements can be posted to the right `kpis/{uuid}/measurements`.
+     * Confirmed real filter support: `GET /api/v1/kpis?kpi_code=&kpi_namespace=&
+     * source_application=` (KpiDefinitionController::index(), Project 1.b source-aware filters).
+     * Returns the KPI's own `uuid`, or null if no matching definition exists yet in ZaiKPI —
+     * per the requirements doc's Milestone 1 gate ("No KPI should be implemented without an
+     * approved definition"), the caller must not silently create one on the fly.
+     */
+    public function findKpiUuid(string $kpiCode, string $kpiNamespace, string $sourceApplication): ?string
+    {
+        $r = $this->http()->get('kpis', [
+            'kpi_code' => $kpiCode,
+            'kpi_namespace' => $kpiNamespace,
+            'source_application' => $sourceApplication,
+            'per_page' => 1,
+        ]);
+        if (! $r->successful()) {
+            return null;
+        }
+        $rows = $r->json('data') ?? [];
+
+        return $rows[0]['uuid'] ?? null;
+    }
+
+    /**
+     * Inbound (Project 2): post one aggregated measurement for a KPI already defined in ZaiKPI.
+     * Real payload shape confirmed from `KpiMeasurementController::store()` — `measured_value`
+     * is a single numeric (NOT the adapter's full breakdown object); `source_event_uuid` is the
+     * idempotent-replay key (a repeated one returns the existing record instead of duplicating).
+     */
+    public function pushMeasurement(string $kpiUuid, array $payload, ?string $idempotencyKey = null): array
+    {
+        $r = $this->withIdem($idempotencyKey)->post("kpis/{$kpiUuid}/measurements", $payload);
+        return $this->result($r);
+    }
+
     /** Outbound (ZaiKPI → FlinkISO): list measurements for a KPI. */
     public function listMeasurements(string $kpiUuid, array $query = []): array
     {
