@@ -6,6 +6,7 @@ use App\Models\Connector;
 use App\Models\ConnectorCredential;
 use App\Models\Workspace;
 use App\Modules\ExecutionContext;
+use App\Modules\LeadHub\PullLeadHubMeasurementsAction;
 use App\Modules\MiroTalk\PullMiroTalkMeasurementsAction;
 use App\Modules\PerfexCrm\PullPerfexCrmMeasurementsAction;
 use App\Modules\RocketLms\PullRocketLmsMeasurementsAction;
@@ -16,9 +17,10 @@ use Illuminate\Support\Str;
 use Tests\TestCase;
 
 /**
- * Project 2 KPI adapters — Perfex CRM, Rocket LMS, Tour Guide and MiroTalk Pull actions.
- * Mirrors ExecutionTest.php's conventions (Http::fake() against real, confirmed response
- * shapes — see project_2_v1_files/docs/0{1,2,3,4,5}-*.md for how each shape was verified).
+ * Project 2 KPI adapters — Perfex CRM, Rocket LMS, Tour Guide, MiroTalk and LeadHub Pull
+ * actions. Mirrors ExecutionTest.php's conventions (Http::fake() against real, confirmed
+ * response shapes — see project_2_v1_files/docs/0{1,2,3,4,5,9}-*.md for how each shape was
+ * verified).
  */
 class Project2AdapterExecutionTest extends TestCase
 {
@@ -50,6 +52,12 @@ class Project2AdapterExecutionTest extends TestCase
             $secretCred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_key_secret', 'type' => 'secret']);
             $secretCred->setSecret('test-mirotalk-secret');
             $secretCred->save();
+        }
+
+        if ($slug === 'leadhub') {
+            $leadHubCred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_key', 'type' => 'secret']);
+            $leadHubCred->setSecret('lh_test-key');
+            $leadHubCred->save();
         }
 
         return $connector->fresh(['credentials']);
@@ -373,6 +381,109 @@ class Project2AdapterExecutionTest extends TestCase
 
         $result = (new PullTourGuideMeasurementsAction())->execute([
             'kpi_code' => 'TG-CHECKLIST-PROGRESS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('not in the approved', $result->error);
+    }
+
+    public function test_leadhub_pull_measurements_computes_new_leads_kpi(): void
+    {
+        Http::fake([
+            '*/api/v1/leads*' => Http::response(['data' => [
+                ['id' => 1, 'status' => 'new', 'created_at' => '2026-08-05T00:00:00Z', 'updated_at' => '2026-08-05T00:00:00Z', 'contacted_at' => null, 'pipeline_stage_id' => null],
+                ['id' => 2, 'status' => 'new', 'created_at' => '2026-08-10T00:00:00Z', 'updated_at' => '2026-08-10T00:00:00Z', 'contacted_at' => null, 'pipeline_stage_id' => null],
+            ], 'meta' => ['current_page' => 1, 'last_page' => 1, 'total' => 2]], 200),
+        ]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'leadhub', 'https://lead.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullLeadHubMeasurementsAction())->execute([
+            'kpi_code' => 'LH-NEW-LEADS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01T00:00:00Z',
+            'period_end' => '2026-08-31T23:59:59Z',
+        ], $context);
+
+        $this->assertTrue($result->success);
+        $this->assertSame(2, $result->output['measurement']['value']['count']);
+        $this->assertSame('leadhub', $result->output['measurement']['source_application']);
+
+        Http::assertSent(fn ($request) => $request->hasHeader('Authorization', 'Bearer lh_test-key'));
+    }
+
+    public function test_leadhub_pull_measurements_computes_won_lost_kpi(): void
+    {
+        Http::fake(function ($request) {
+            parse_str((string) parse_url($request->url(), PHP_URL_QUERY), $query);
+
+            return match ($query['status'] ?? null) {
+                'won' => Http::response(['data' => [
+                    ['id' => 1, 'status' => 'won', 'updated_at' => '2026-08-15T00:00:00Z'],
+                ], 'meta' => ['current_page' => 1, 'last_page' => 1]], 200),
+                'lost' => Http::response(['data' => [
+                    ['id' => 2, 'status' => 'lost', 'updated_at' => '2026-08-20T00:00:00Z'],
+                    ['id' => 3, 'status' => 'lost', 'updated_at' => '2026-07-01T00:00:00Z'], // outside period
+                ], 'meta' => ['current_page' => 1, 'last_page' => 1]], 200),
+                default => Http::response(['data' => [], 'meta' => ['current_page' => 1, 'last_page' => 1]], 200),
+            };
+        });
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'leadhub', 'https://lead.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullLeadHubMeasurementsAction())->execute([
+            'kpi_code' => 'LH-WON-LOST',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01T00:00:00Z',
+            'period_end' => '2026-08-31T23:59:59Z',
+        ], $context);
+
+        $this->assertTrue($result->success);
+        $this->assertSame(1, $result->output['measurement']['value']['won']);
+        $this->assertSame(1, $result->output['measurement']['value']['lost']);
+    }
+
+    public function test_leadhub_pull_measurements_computes_response_time_kpi(): void
+    {
+        Http::fake([
+            '*/api/v1/leads*' => Http::response(['data' => [
+                ['id' => 1, 'created_at' => '2026-08-05T00:00:00Z', 'contacted_at' => '2026-08-05T02:00:00Z'],
+                ['id' => 2, 'created_at' => '2026-08-06T00:00:00Z', 'contacted_at' => '2026-08-06T04:00:00Z'],
+                ['id' => 3, 'created_at' => '2026-08-07T00:00:00Z', 'contacted_at' => null], // never contacted
+            ], 'meta' => ['current_page' => 1, 'last_page' => 1]], 200),
+        ]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'leadhub', 'https://lead.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullLeadHubMeasurementsAction())->execute([
+            'kpi_code' => 'LH-RESPONSE-TIME',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01T00:00:00Z',
+            'period_end' => '2026-08-31T23:59:59Z',
+        ], $context);
+
+        $this->assertTrue($result->success);
+        $this->assertSame(2, $result->output['measurement']['value']['contacted_count']);
+        $this->assertSame(3.0, $result->output['measurement']['value']['average_hours']);
+    }
+
+    public function test_leadhub_pull_measurements_rejects_unapproved_kpi(): void
+    {
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'leadhub', 'https://lead.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullLeadHubMeasurementsAction())->execute([
+            'kpi_code' => 'LH-PIPELINE-AGING',
             'tenant_uuid' => (string) Str::uuid(),
             'period_start' => '2026-08-01',
             'period_end' => '2026-08-31',
