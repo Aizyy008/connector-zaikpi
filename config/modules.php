@@ -2,6 +2,7 @@
 
 use App\Modules\Builtin\CreateInvoiceAction;
 use App\Modules\Builtin\WebhookReceivedTrigger;
+use App\Modules\MiroTalk\PullMiroTalkMeasurementsAction;
 use App\Modules\PerfexCrm\PullPerfexCrmMeasurementsAction;
 use App\Modules\RocketLms\PullRocketLmsMeasurementsAction;
 use App\Modules\TourGuide\PullTourGuideMeasurementsAction;
@@ -36,6 +37,7 @@ return [
         PullPerfexCrmMeasurementsAction::class,
         PullRocketLmsMeasurementsAction::class,
         PullTourGuideMeasurementsAction::class,
+        PullMiroTalkMeasurementsAction::class,
     ],
 
 ];

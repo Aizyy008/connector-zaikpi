@@ -6,6 +6,7 @@ use App\Models\Connector;
 use App\Models\ConnectorCredential;
 use App\Models\Workspace;
 use App\Modules\ExecutionContext;
+use App\Modules\MiroTalk\PullMiroTalkMeasurementsAction;
 use App\Modules\PerfexCrm\PullPerfexCrmMeasurementsAction;
 use App\Modules\RocketLms\PullRocketLmsMeasurementsAction;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -42,6 +43,12 @@ class Project2AdapterExecutionTest extends TestCase
             $apiKeyCred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_key', 'type' => 'secret']);
             $apiKeyCred->setSecret('test-api-key');
             $apiKeyCred->save();
+        }
+
+        if ($slug === 'mirotalk') {
+            $secretCred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_key_secret', 'type' => 'secret']);
+            $secretCred->setSecret('test-mirotalk-secret');
+            $secretCred->save();
         }
 
         return $connector->fresh(['credentials']);
@@ -262,5 +269,53 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertTrue($result->success);
         $this->assertSame(2, $result->output['measurement']['value']['courses']);
         $this->assertSame(50.0, $result->output['measurement']['value']['average_progress']);
+    }
+
+    public function test_mirotalk_pull_measurements_computes_active_rooms_and_users(): void
+    {
+        Http::fake([
+            '*/api/v1/stats*' => Http::response(['success' => true, 'timestamp' => now()->toIso8601String(), 'totalRooms' => 3, 'totalUsers' => 7], 200),
+        ]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'mirotalk', 'https://11161115.xyz');
+        $context = new ExecutionContext($ws, $connector);
+
+        $rooms = (new PullMiroTalkMeasurementsAction())->execute([
+            'kpi_code' => 'MT-ACTIVE-ROOMS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+        $this->assertTrue($rooms->success);
+        $this->assertSame(3, $rooms->output['measurement']['value']['count']);
+
+        $users = (new PullMiroTalkMeasurementsAction())->execute([
+            'kpi_code' => 'MT-ACTIVE-USERS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+        $this->assertTrue($users->success);
+        $this->assertSame(7, $users->output['measurement']['value']['count']);
+
+        Http::assertSent(fn ($request) => $request->hasHeader('authorization', 'test-mirotalk-secret'));
+    }
+
+    public function test_mirotalk_pull_measurements_rejects_unapproved_kpi(): void
+    {
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'mirotalk', 'https://11161115.xyz');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullMiroTalkMeasurementsAction())->execute([
+            'kpi_code' => 'MT-NOT-A-REAL-KPI',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('not in the approved', $result->error);
     }
 }
