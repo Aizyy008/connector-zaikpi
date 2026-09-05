@@ -28,13 +28,23 @@ class ZaiKpiClient
         return new self($baseUrl, $token, (int) ($connector->config['timeout'] ?? 10));
     }
 
-    private function http(): PendingRequest
+    /**
+     * `$correlationId`, when given, is sent as `X-Correlation-ID` — ZaiKPI's own
+     * `CorrelationId` middleware reads that header (falling back to a fresh one only if absent),
+     * so this is what actually completes the source → Connector → ZaiKPI trace (client-requested
+     * fix, 2026-09-05 review — the measurement POST body itself has no correlation_id field,
+     * confirmed from `KpiMeasurementController::store()`'s validation rules, so the header is the
+     * real carrier, not a payload field).
+     */
+    private function http(?string $correlationId = null): PendingRequest
     {
-        return Http::baseUrl($this->baseUrl . '/api/v1')
+        $request = Http::baseUrl($this->baseUrl . '/api/v1')
             ->timeout($this->timeout)
             ->withToken($this->token)
             ->acceptJson()
             ->asJson();
+
+        return $correlationId ? $request->withHeaders(['X-Correlation-ID' => $correlationId]) : $request;
     }
 
     /** Connection test used by the connector health check. */
@@ -67,9 +77,9 @@ class ZaiKpiClient
      * per the requirements doc's Milestone 1 gate ("No KPI should be implemented without an
      * approved definition"), the caller must not silently create one on the fly.
      */
-    public function findKpiUuid(string $kpiCode, string $kpiNamespace, string $sourceApplication): ?string
+    public function findKpiUuid(string $kpiCode, string $kpiNamespace, string $sourceApplication, ?string $correlationId = null): ?string
     {
-        $r = $this->http()->get('kpis', [
+        $r = $this->http($correlationId)->get('kpis', [
             'kpi_code' => $kpiCode,
             'kpi_namespace' => $kpiNamespace,
             'source_application' => $sourceApplication,
@@ -89,9 +99,9 @@ class ZaiKpiClient
      * is a single numeric (NOT the adapter's full breakdown object); `source_event_uuid` is the
      * idempotent-replay key (a repeated one returns the existing record instead of duplicating).
      */
-    public function pushMeasurement(string $kpiUuid, array $payload, ?string $idempotencyKey = null): array
+    public function pushMeasurement(string $kpiUuid, array $payload, ?string $idempotencyKey = null, ?string $correlationId = null): array
     {
-        $r = $this->withIdem($idempotencyKey)->post("kpis/{$kpiUuid}/measurements", $payload);
+        $r = $this->withIdem($idempotencyKey, $correlationId)->post("kpis/{$kpiUuid}/measurements", $payload);
         return $this->result($r);
     }
 
@@ -109,13 +119,13 @@ class ZaiKpiClient
         return $this->result($r);
     }
 
-    private function withIdem(?string $key): PendingRequest
+    private function withIdem(?string $key, ?string $correlationId = null): PendingRequest
     {
-        $req = $this->http();
+        $req = $this->http($correlationId);
         return $key ? $req->withHeaders(['Idempotency-Key' => $key]) : $req;
     }
 
-    private function result($response): array
+    private function result(\Illuminate\Http\Client\Response $response): array
     {
         return [
             'ok' => $response->successful(),

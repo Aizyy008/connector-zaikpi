@@ -6,21 +6,15 @@ use App\Modules\AbstractModule;
 use App\Modules\ExecutionContext;
 use App\Modules\ExecutionResult;
 use App\Modules\ModuleHealth;
-use App\Services\ZaiKpi\ZaiKpiClient;
+use App\Support\KpiAdapters\ZaiKpiDelivery;
 
 /**
- * Inbound (Project 2's 5 KPI adapters → ZaiKPI): the missing second half of "source → Connector
- * → ZaiKPI". A `Pull*MeasurementsAction` (Perfex CRM/Rocket LMS/Tour Guide/MiroTalk/LeadHub)
- * only reads from its source and returns a measurement — it doesn't call ZaiKPI itself, mirroring
- * `PushKpiDefinitionAction`'s existing pattern of one module per external system rather than one
- * module juggling two. This module takes that measurement (already in the common KPI contract
- * shape — see `AdapterEventEnvelope::contractFields()`) and delivers it to ZaiKPI's real
- * `POST /kpis/{uuid}/measurements` (confirmed from `KpiMeasurementController::store()`, not
- * guessed). Generic across all 5 sources — the contract shape is source-agnostic by design.
- *
- * Requires the target KPI to already exist in ZaiKPI (found via `kpi_code`+`kpi_namespace`+
- * `source_application`) — per the requirements doc's Milestone 1 gate ("No KPI should be
- * implemented without an approved definition"), this module never creates one on the fly.
+ * Standalone/manual re-delivery of an already-computed measurement into ZaiKPI. As of the
+ * 2026-09-05 review, each of the 5 `Pull*MeasurementsAction` modules delivers its own
+ * measurement automatically (via the same `ZaiKpiDelivery::deliver()` this module calls) — a
+ * normal execution no longer needs this module run as a separate manual step. This module stays
+ * registered for the case where a measurement needs re-pushing without re-pulling from the
+ * source (e.g. after fixing a ZaiKPI-side definition problem).
  */
 class PushMeasurementToZaiKpiAction extends AbstractModule
 {
@@ -31,7 +25,7 @@ class PushMeasurementToZaiKpiAction extends AbstractModule
 
     public function name(): string
     {
-        return 'ZaiKPI · Push Measurement';
+        return 'ZaiKPI · Push Measurement (manual re-delivery)';
     }
 
     public function type(): string
@@ -41,7 +35,7 @@ class PushMeasurementToZaiKpiAction extends AbstractModule
 
     public function description(): string
     {
-        return 'Delivers one already-computed KPI measurement (from any of the 5 Project 2 source adapters) into ZaiKPI.';
+        return 'Manually (re-)delivers one already-computed KPI measurement into ZaiKPI — not needed for normal operation, since every Pull*MeasurementsAction now delivers automatically.';
     }
 
     public function actions(): array
@@ -78,47 +72,15 @@ class PushMeasurementToZaiKpiAction extends AbstractModule
         if (! is_array($measurement)) {
             return ExecutionResult::fail('measurement is required.');
         }
-        foreach (['kpi_code', 'kpi_namespace', 'source_application', 'period_start', 'period_end', 'external_uuid'] as $required) {
-            if (empty($measurement[$required])) {
-                return ExecutionResult::fail("measurement.{$required} is required.");
-            }
-        }
-        if (! isset($measurement['primary_value']) || ! is_numeric($measurement['primary_value'])) {
-            return ExecutionResult::fail(
-                "measurement.primary_value is required and must be numeric — kpi_code '{$measurement['kpi_code']}' either doesn't reduce to a single trackable number (e.g. a status breakdown) or the source adapter didn't set one."
-            );
-        }
 
-        $client = ZaiKpiClient::forConnector($context->connector);
-
-        $kpiUuid = $client->findKpiUuid($measurement['kpi_code'], $measurement['kpi_namespace'], $measurement['source_application']);
-        if ($kpiUuid === null) {
-            return ExecutionResult::fail(
-                "No approved KPI definition found in ZaiKPI for kpi_code '{$measurement['kpi_code']}' in namespace '{$measurement['kpi_namespace']}' — per Milestone 1, a KPI definition must be approved in ZaiKPI before its measurements can be pushed."
-            );
-        }
-
-        $payload = [
-            'uuid' => $measurement['external_uuid'],
-            'period_start' => $measurement['period_start'],
-            'period_end' => $measurement['period_end'],
-            'measured_value' => (float) $measurement['primary_value'],
-            'measurement_source' => $measurement['source_application'],
-            'notes' => isset($measurement['value']) ? json_encode($measurement['value']) : null,
-            'source_event_uuid' => $measurement['source_event_uuid'] ?? $measurement['external_uuid'],
-            'measured_at' => $measurement['measured_at'] ?? null,
-        ];
-
-        $idem = $measurement['source_event_uuid'] ?? $measurement['external_uuid'];
-        $result = $client->pushMeasurement($kpiUuid, $payload, $idem);
-
-        if (! $result['ok']) {
-            return ExecutionResult::fail($result['error'] ?? 'ZaiKPI measurement push failed', ['status' => $result['status']]);
+        $delivery = ZaiKpiDelivery::deliver($context, $measurement);
+        if (! $delivery['ok']) {
+            return ExecutionResult::fail($delivery['error']);
         }
 
         return ExecutionResult::ok([
-            'zaikpi_kpi_uuid' => $kpiUuid,
-            'zaikpi_measurement_uuid' => $result['data']['uuid'] ?? null,
+            'zaikpi_kpi_uuid' => $delivery['zaikpi_kpi_uuid'],
+            'zaikpi_measurement_uuid' => $delivery['zaikpi_measurement_uuid'],
         ]);
     }
 }

@@ -8,16 +8,22 @@ use App\Modules\ExecutionResult;
 use App\Modules\ModuleHealth;
 use App\Services\PerfexCrm\PerfexCrmClient;
 use App\Support\KpiAdapters\AdapterEventEnvelope;
-use Illuminate\Support\Str;
+use App\Support\KpiAdapters\ZaiKpiDelivery;
 
 /**
  * Perfex CRM KPI adapter (Project 2, requirements doc Milestone 3). Pulls one period's
  * aggregated measurement for an approved KPI from `modules/api` (see
  * project_2_v1_files/docs/04-perfex-crm-{audit,data-dictionary}.md — field names/status codes
- * are CONFIRMED from the live install's own source, not guessed).
+ * are CONFIRMED from the live install's own source, not guessed), then delivers it to ZaiKPI —
+ * a single execution performs the complete source → Connector → ZaiKPI flow (client-requested
+ * fix, 2026-09-05 review), it no longer stops at "computed but not delivered."
  *
- * Scope: read-only, aggregated measurements only — no source-side code, no raw record sync,
- * matching this adapter's "pure Connector-side module" decision in the audit doc.
+ * `external_uuid`/`source_event_uuid` are deterministic (same tenant/kpi/period → same value —
+ * see `AdapterEventEnvelope::deterministicUuid()`), so re-running the same KPI for the same
+ * period is a safe replay, not a duplicate measurement.
+ *
+ * Scope: read-only against the source, aggregated measurements only — no source-side code, no
+ * raw record sync, matching this adapter's "pure Connector-side module" decision in the audit.
  */
 class PullPerfexCrmMeasurementsAction extends AbstractModule
 {
@@ -44,7 +50,7 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
 
     public function description(): string
     {
-        return 'Reads one aggregated KPI measurement (leads, invoices, payments, projects, tasks) from Perfex CRM for a period, for delivery to ZaiKPI.';
+        return 'Reads one aggregated KPI measurement (leads, invoices, payments, projects, tasks) from Perfex CRM for a period, and delivers it to ZaiKPI in one execution.';
     }
 
     public function actions(): array
@@ -64,12 +70,12 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
 
     public function outputSchema(): array
     {
-        return ['measurement' => 'object'];
+        return ['measurement' => 'object', 'zaikpi_kpi_uuid' => 'string', 'zaikpi_measurement_uuid' => 'string'];
     }
 
     public function scopes(): array
     {
-        return ['flows.execute', 'measurements:read'];
+        return ['flows.execute', 'measurements:read', 'measurements:write'];
     }
 
     public function healthCheck(): ModuleHealth
@@ -91,8 +97,11 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
             return ExecutionResult::fail("kpi_code '{$input['kpi_code']}' is not in the approved Perfex CRM KPI catalogue.");
         }
 
+        $startTs = AdapterEventEnvelope::periodStartTimestamp($input['period_start']);
+        $endTs = AdapterEventEnvelope::periodEndTimestamp($input['period_end']);
+
         $client = PerfexCrmClient::forConnector($context->connector);
-        $value = $this->compute($client, $input['kpi_code'], $input['period_start'], $input['period_end']);
+        $value = $this->compute($client, $input['kpi_code'], $startTs, $endTs);
 
         if ($value === null) {
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Perfex CRM API call did not succeed.");
@@ -102,29 +111,41 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
             'tenant_uuid' => $input['tenant_uuid'],
             'source_application' => 'perfex_crm',
             'source_entity_type' => 'kpi_measurement',
-            'external_uuid' => (string) Str::uuid(),
             'kpi_namespace' => 'perfex_crm.' . strtolower(str_replace('perfex_crm.', '', $this->domainFor($input['kpi_code']))),
             'kpi_code' => $input['kpi_code'],
             'kpi_domain' => $this->domainFor($input['kpi_code']),
             'period_start' => $input['period_start'],
             'period_end' => $input['period_end'],
             'measured_at' => now()->toIso8601String(),
-            // Inherits an inbound correlation id when the caller supplies one (e.g. a future
-            // ExecutionJob.correlation_id threaded through ExecutionContext::$meta), so a trace
-            // can survive source → Connector → ZaiKPI. Falls back to a fresh id otherwise —
-            // see AdapterEventEnvelope::contractFields()'s own default.
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        // `primary_value` is the single number PushMeasurementToZaiKpiAction sends as ZaiKPI's
-        // `measured_value` (ZaiKPI tracks one scored number per KPI per period, not a breakdown
-        // object). Chosen per the unit already documented in 04-perfex-crm-data-dictionary.md §2.
-        // PX-TASK-STATUS is deliberately null — it's a status distribution, not a single
-        // trackable value; it's still computed and returned for Connector-side visibility, just
-        // not pushed to ZaiKPI as-is (see 07-modification-register.md).
+        // `primary_value` is the single number ZaiKpiDelivery sends as ZaiKPI's `measured_value`
+        // (ZaiKPI tracks one scored number per KPI per period, not a breakdown object). Chosen
+        // per the unit already documented in 04-perfex-crm-data-dictionary.md §2. PX-TASK-STATUS
+        // is deliberately null — it's a status distribution, not a single trackable value; it's
+        // still computed and returned for Connector-side visibility, just not pushed to ZaiKPI
+        // (see 07-modification-register.md).
         $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+        $measurement = $fields + ['value' => $value, 'primary_value' => $primaryValue];
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+        if ($primaryValue === null) {
+            return ExecutionResult::ok(['measurement' => $measurement, 'zaikpi_push_skipped' => 'no single trackable value for this KPI']);
+        }
+
+        $delivery = ZaiKpiDelivery::deliver($context, $measurement);
+        if (! $delivery['ok']) {
+            return ExecutionResult::fail(
+                "Computed {$input['kpi_code']} but failed to deliver it to ZaiKPI: {$delivery['error']}",
+                ['measurement' => $measurement],
+            );
+        }
+
+        return ExecutionResult::ok([
+            'measurement' => $measurement,
+            'zaikpi_kpi_uuid' => $delivery['zaikpi_kpi_uuid'],
+            'zaikpi_measurement_uuid' => $delivery['zaikpi_measurement_uuid'],
+        ]);
     }
 
     private function primaryValueFor(string $kpiCode, array $value): ?float
@@ -167,45 +188,50 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
      * action does `UPDATE leads SET date_converted = NOW(), ...` on the lead row itself.
      * `Leads_model::get()` selects `*` from `leads`, so `date_converted` is already present in
      * every `GET /api/leads` response — no new endpoint, reuses countInPeriod() exactly like
-     * PX-LEADS (isset() on a null `date_converted` already excludes non-converted leads).
+     * PX-LEADS (a null `date_converted` is simply unparseable/absent and excluded).
+     *
+     * Date comparisons use real Unix timestamps (via AdapterEventEnvelope's helpers), not raw
+     * string comparison — fixed 2026-09-05 per client review: comparing Perfex's date strings
+     * (some bare dates, some with a time component) lexically could wrongly exclude records on
+     * the period's own end date.
      */
     private const INVOICE_STATUS_PAID = 2;
     private const TASK_STATUS_COMPLETE = 5;
     private const PROJECT_STATUS_FINISHED = 4;
 
-    private function compute(PerfexCrmClient $client, string $kpiCode, string $start, string $end): ?array
+    private function compute(PerfexCrmClient $client, string $kpiCode, int $startTs, int $endTs): ?array
     {
         return match ($kpiCode) {
-            'PX-LEADS' => $this->countInPeriod($client, 'leads', 'dateadded', $start, $end),
-            'PX-LEAD-CONVERSION' => $this->countInPeriod($client, 'leads', 'date_converted', $start, $end),
-            'PX-INVOICES' => $this->countAndSum($client, 'invoices', 'date', 'total', $start, $end),
-            'PX-COLLECTIONS' => $this->countAndSum($client, 'payments', 'date', 'amount', $start, $end),
+            'PX-LEADS' => $this->countInPeriod($client, 'leads', 'dateadded', $startTs, $endTs),
+            'PX-LEAD-CONVERSION' => $this->countInPeriod($client, 'leads', 'date_converted', $startTs, $endTs),
+            'PX-INVOICES' => $this->countAndSum($client, 'invoices', 'date', 'total', $startTs, $endTs),
+            'PX-COLLECTIONS' => $this->countAndSum($client, 'payments', 'date', 'amount', $startTs, $endTs),
             'PX-OUTSTANDING-BALANCE' => $this->sumWhere($client, 'invoices', fn ($r) => (int) ($r['status'] ?? 0) !== self::INVOICE_STATUS_PAID, 'total'),
-            'PX-PROJECT-COMPLETION' => $this->rate($client, 'projects', null, $start, $end, fn ($r) => (int) ($r['status'] ?? 0) === self::PROJECT_STATUS_FINISHED),
+            'PX-PROJECT-COMPLETION' => $this->rate($client, 'projects', null, $startTs, $endTs, fn ($r) => (int) ($r['status'] ?? 0) === self::PROJECT_STATUS_FINISHED),
             'PX-TASK-STATUS' => $this->breakdown($client, 'tasks', 'status'),
-            'PX-OVERDUE-WORK' => $this->countWhere($client, 'tasks', fn ($r) => ! empty($r['duedate']) && $r['duedate'] < $end && (int) ($r['status'] ?? 0) !== self::TASK_STATUS_COMPLETE),
+            'PX-OVERDUE-WORK' => $this->countWhere($client, 'tasks', fn ($r) => ! empty($r['duedate']) && (strtotime($r['duedate']) ?: PHP_INT_MAX) < $endTs && (int) ($r['status'] ?? 0) !== self::TASK_STATUS_COMPLETE),
             default => null,
         };
     }
 
-    private function countInPeriod(PerfexCrmClient $client, string $resource, string $dateField, string $start, string $end): ?array
+    private function countInPeriod(PerfexCrmClient $client, string $resource, string $dateField, int $startTs, int $endTs): ?array
     {
         $result = $client->list($resource);
         if (! $result['ok']) {
             return null;
         }
-        $rows = collect($result['data'])->filter(fn ($r) => isset($r[$dateField]) && $r[$dateField] >= $start && $r[$dateField] <= $end);
+        $rows = collect($result['data'])->filter(fn ($r) => AdapterEventEnvelope::timestampInRange($r[$dateField] ?? null, $startTs, $endTs));
 
         return ['count' => $rows->count()];
     }
 
-    private function countAndSum(PerfexCrmClient $client, string $resource, string $dateField, string $sumField, string $start, string $end): ?array
+    private function countAndSum(PerfexCrmClient $client, string $resource, string $dateField, string $sumField, int $startTs, int $endTs): ?array
     {
         $result = $client->list($resource);
         if (! $result['ok']) {
             return null;
         }
-        $rows = collect($result['data'])->filter(fn ($r) => isset($r[$dateField]) && $r[$dateField] >= $start && $r[$dateField] <= $end);
+        $rows = collect($result['data'])->filter(fn ($r) => AdapterEventEnvelope::timestampInRange($r[$dateField] ?? null, $startTs, $endTs));
 
         return ['count' => $rows->count(), 'sum' => (float) $rows->sum($sumField)];
     }
@@ -230,7 +256,7 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
         return ['count' => collect($result['data'])->filter($predicate)->count()];
     }
 
-    private function rate(PerfexCrmClient $client, string $resource, ?string $dateField, string $start, string $end, callable $matchPredicate): ?array
+    private function rate(PerfexCrmClient $client, string $resource, ?string $dateField, int $startTs, int $endTs, callable $matchPredicate): ?array
     {
         $result = $client->list($resource);
         if (! $result['ok']) {
@@ -238,7 +264,7 @@ class PullPerfexCrmMeasurementsAction extends AbstractModule
         }
         $rows = collect($result['data']);
         if ($dateField) {
-            $rows = $rows->filter(fn ($r) => isset($r[$dateField]) && $r[$dateField] >= $start && $r[$dateField] <= $end);
+            $rows = $rows->filter(fn ($r) => AdapterEventEnvelope::timestampInRange($r[$dateField] ?? null, $startTs, $endTs));
         }
         $total = $rows->count();
 

@@ -8,12 +8,13 @@ use App\Modules\ExecutionResult;
 use App\Modules\ModuleHealth;
 use App\Services\LeadHub\LeadHubClient;
 use App\Support\KpiAdapters\AdapterEventEnvelope;
-use Illuminate\Support\Str;
+use App\Support\KpiAdapters\ZaiKpiDelivery;
 
 /**
  * LeadHub KPI adapter (Project 2, requirements doc Milestone 4). Pulls one period's aggregated
  * measurement for an approved KPI from LeadHub's real REST API (see
- * project_2_v1_files/docs/09-leadhub-{audit,data-dictionary}.md).
+ * project_2_v1_files/docs/09-leadhub-{audit,data-dictionary}.md), then delivers it to ZaiKPI in
+ * the same execution (client-requested fix, 2026-09-05 review).
  *
  * IMPORTANT — LeadHub's own event log (`lead_activities`: status_changed, stage_moved, etc.) has
  * NO REST endpoint (confirmed by reading the full routes/api.php, not a gap from missing
@@ -48,7 +49,7 @@ class PullLeadHubMeasurementsAction extends AbstractModule
 
     public function description(): string
     {
-        return 'Reads one aggregated lead-pipeline KPI measurement (new/qualified leads, won/lost outcomes, response time, stage conversion) from LeadHub for a period, for delivery to ZaiKPI.';
+        return 'Reads one aggregated lead-pipeline KPI measurement (new/qualified leads, won/lost outcomes, response time, stage conversion) from LeadHub for a period, and delivers it to ZaiKPI in one execution.';
     }
 
     public function actions(): array
@@ -68,12 +69,12 @@ class PullLeadHubMeasurementsAction extends AbstractModule
 
     public function outputSchema(): array
     {
-        return ['measurement' => 'object'];
+        return ['measurement' => 'object', 'zaikpi_kpi_uuid' => 'string', 'zaikpi_measurement_uuid' => 'string'];
     }
 
     public function scopes(): array
     {
-        return ['flows.execute', 'measurements:read'];
+        return ['flows.execute', 'measurements:read', 'measurements:write'];
     }
 
     public function healthCheck(): ModuleHealth
@@ -95,8 +96,11 @@ class PullLeadHubMeasurementsAction extends AbstractModule
             return ExecutionResult::fail("kpi_code '{$input['kpi_code']}' is not in the approved LeadHub KPI catalogue (or its source field is unconfirmed — see 09-leadhub-data-dictionary.md).");
         }
 
+        $startTs = AdapterEventEnvelope::periodStartTimestamp($input['period_start']);
+        $endTs = AdapterEventEnvelope::periodEndTimestamp($input['period_end']);
+
         $client = LeadHubClient::forConnector($context->connector);
-        $value = $this->compute($client, $input['kpi_code'], $input['period_start'], $input['period_end']);
+        $value = $this->compute($client, $input['kpi_code'], $input['period_start'], $input['period_end'], $startTs, $endTs);
 
         if ($value === null) {
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the LeadHub API call did not succeed.");
@@ -106,24 +110,37 @@ class PullLeadHubMeasurementsAction extends AbstractModule
             'tenant_uuid' => $input['tenant_uuid'],
             'source_application' => 'leadhub',
             'source_entity_type' => 'lead',
-            'external_uuid' => (string) Str::uuid(),
             'kpi_namespace' => 'leadhub.pipeline',
             'kpi_code' => $input['kpi_code'],
             'kpi_domain' => 'pipeline',
             'period_start' => $input['period_start'],
             'period_end' => $input['period_end'],
             'measured_at' => now()->toIso8601String(),
-            // Inherits an inbound correlation id when supplied via ExecutionContext::$meta —
-            // see PullPerfexCrmMeasurementsAction for the full rationale.
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        // See PullPerfexCrmMeasurementsAction's execute() for why this exists. LH-WON-LOST's
-        // primary is `won` (the actionable positive outcome) — `lost` stays in the full value
-        // breakdown for context.
+        // LH-WON-LOST's primary is `won` (the actionable positive outcome) — `lost` stays in the
+        // full value breakdown for context.
         $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+        $measurement = $fields + ['value' => $value, 'primary_value' => $primaryValue];
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+        if ($primaryValue === null) {
+            return ExecutionResult::ok(['measurement' => $measurement, 'zaikpi_push_skipped' => 'no single trackable value for this KPI']);
+        }
+
+        $delivery = ZaiKpiDelivery::deliver($context, $measurement);
+        if (! $delivery['ok']) {
+            return ExecutionResult::fail(
+                "Computed {$input['kpi_code']} but failed to deliver it to ZaiKPI: {$delivery['error']}",
+                ['measurement' => $measurement],
+            );
+        }
+
+        return ExecutionResult::ok([
+            'measurement' => $measurement,
+            'zaikpi_kpi_uuid' => $delivery['zaikpi_kpi_uuid'],
+            'zaikpi_measurement_uuid' => $delivery['zaikpi_measurement_uuid'],
+        ]);
     }
 
     private function primaryValueFor(string $kpiCode, array $value): ?float
@@ -139,12 +156,12 @@ class PullLeadHubMeasurementsAction extends AbstractModule
         return $key !== null && isset($value[$key]) ? (float) $value[$key] : null;
     }
 
-    private function compute(LeadHubClient $client, string $kpiCode, string $start, string $end): ?array
+    private function compute(LeadHubClient $client, string $kpiCode, string $start, string $end, int $startTs, int $endTs): ?array
     {
         return match ($kpiCode) {
             'LH-NEW-LEADS' => $this->newLeads($client, $start, $end),
-            'LH-QUALIFIED-LEADS' => $this->statusCountInPeriod($client, 'qualified', $start, $end),
-            'LH-WON-LOST' => $this->wonLost($client, $start, $end),
+            'LH-QUALIFIED-LEADS' => $this->statusCountInPeriod($client, 'qualified', $startTs, $endTs),
+            'LH-WON-LOST' => $this->wonLost($client, $startTs, $endTs),
             'LH-RESPONSE-TIME' => $this->responseTime($client, $start, $end),
             'LH-STAGE-CONVERSION' => $this->stageConversion($client, $start, $end),
             default => null,
@@ -161,24 +178,28 @@ class PullLeadHubMeasurementsAction extends AbstractModule
         return ['count' => count($result['data'])];
     }
 
-    /** `updated_at`-filtered — best available proxy, see class docblock. */
-    private function statusCountInPeriod(LeadHubClient $client, string $status, string $start, string $end): ?array
+    /**
+     * `updated_at`-filtered — best available proxy, see class docblock. Uses real timestamp
+     * comparison, not raw string comparison (client-flagged bug, 2026-09-05: a bare-date
+     * period_end could wrongly exclude same-day records that carry a time component).
+     */
+    private function statusCountInPeriod(LeadHubClient $client, string $status, int $startTs, int $endTs): ?array
     {
         $result = $client->leadsByStatus($status);
         if (! $result['ok']) {
             return null;
         }
         $count = collect($result['data'])->filter(
-            fn ($r) => isset($r['updated_at']) && $r['updated_at'] >= $start && $r['updated_at'] <= $end
+            fn ($r) => AdapterEventEnvelope::timestampInRange($r['updated_at'] ?? null, $startTs, $endTs)
         )->count();
 
         return ['count' => $count];
     }
 
-    private function wonLost(LeadHubClient $client, string $start, string $end): ?array
+    private function wonLost(LeadHubClient $client, int $startTs, int $endTs): ?array
     {
-        $won = $this->statusCountInPeriod($client, 'won', $start, $end);
-        $lost = $this->statusCountInPeriod($client, 'lost', $start, $end);
+        $won = $this->statusCountInPeriod($client, 'won', $startTs, $endTs);
+        $lost = $this->statusCountInPeriod($client, 'lost', $startTs, $endTs);
         if ($won === null || $lost === null) {
             return null;
         }

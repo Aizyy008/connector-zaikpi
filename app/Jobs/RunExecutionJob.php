@@ -60,7 +60,11 @@ class RunExecutionJob implements ShouldQueue
                 }
             }
 
-            $context = new ExecutionContext($job->workspace, $job->connector);
+            // Client-requested fix (2026-09-05 review): propagate the job's correlation id into
+            // ExecutionContext::$meta so a module can carry it through to whatever it delivers
+            // to next (e.g. ZaiKpiDelivery's outbound X-Correlation-ID header), completing the
+            // source → Connector → ZaiKPI trace.
+            $context = new ExecutionContext($job->workspace, $job->connector, ['correlation_id' => $job->correlation_id]);
             $result = $module->execute($job->input ?? [], $context);
 
             $job->forceFill([

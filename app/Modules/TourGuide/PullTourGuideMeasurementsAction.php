@@ -8,14 +8,16 @@ use App\Modules\ExecutionResult;
 use App\Modules\ModuleHealth;
 use App\Services\TourGuide\TourGuideClient;
 use App\Support\KpiAdapters\AdapterEventEnvelope;
+use App\Support\KpiAdapters\ZaiKpiDelivery;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Str;
 
 /**
  * Tour Guide (Usertour) KPI adapter (Project 2, requirements doc Milestone 5). Pulls one
  * period's aggregated measurement for an approved KPI, across ALL content (guides/tours) —
  * `GET /v1/content-sessions` requires a `contentId` per call (confirmed live), so this pulls
- * `content` first, then sessions per content id, then aggregates.
+ * `content` first, then sessions per content id, then aggregates — following every page for
+ * both (client-flagged bug, 2026-09-05 review: only the first page was read before). Then
+ * delivers the result to ZaiKPI in the same execution (client-requested fix, 2026-09-05).
  *
  * Field names CONFIRMED 2026-09-03 from the live OpenAPI schema (`ContentSession` component) —
  * real fields are camelCase, NOT the snake_case originally guessed: `completed` (boolean),
@@ -53,7 +55,7 @@ class PullTourGuideMeasurementsAction extends AbstractModule
 
     public function description(): string
     {
-        return 'Reads one aggregated onboarding/adoption KPI measurement from Tour Guide (Usertour) for a period, for delivery to ZaiKPI.';
+        return 'Reads one aggregated onboarding/adoption KPI measurement from Tour Guide (Usertour) for a period, and delivers it to ZaiKPI in one execution.';
     }
 
     public function actions(): array
@@ -74,12 +76,12 @@ class PullTourGuideMeasurementsAction extends AbstractModule
 
     public function outputSchema(): array
     {
-        return ['measurement' => 'object'];
+        return ['measurement' => 'object', 'zaikpi_kpi_uuid' => 'string', 'zaikpi_measurement_uuid' => 'string'];
     }
 
     public function scopes(): array
     {
-        return ['flows.execute', 'measurements:read'];
+        return ['flows.execute', 'measurements:read', 'measurements:write'];
     }
 
     public function healthCheck(): ModuleHealth
@@ -101,35 +103,51 @@ class PullTourGuideMeasurementsAction extends AbstractModule
             return ExecutionResult::fail("kpi_code '{$input['kpi_code']}' is not in the approved Tour Guide KPI catalogue (or its source field is unconfirmed — see 02-tour-guide-data-dictionary.md).");
         }
 
+        $startTs = AdapterEventEnvelope::periodStartTimestamp($input['period_start']);
+        $endTs = AdapterEventEnvelope::periodEndTimestamp($input['period_end']);
+
         $client = TourGuideClient::forConnector($context->connector);
-        $sessions = $this->collectSessions($client, $input);
+        $sessions = $this->collectSessions($client, $input, $startTs, $endTs);
         if ($sessions === null) {
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Tour Guide API call did not succeed.");
         }
 
-        $value = $this->compute($input['kpi_code'], $sessions, $input);
+        $value = $this->compute($input['kpi_code'], $sessions);
 
         $fields = AdapterEventEnvelope::contractFields([
             'tenant_uuid' => $input['tenant_uuid'],
             'source_application' => 'tour_guide',
             'source_entity_type' => 'content',
             'source_entity_uuid' => $input['content_id'] ?? null,
-            'external_uuid' => (string) Str::uuid(),
             'kpi_namespace' => 'tour_guide.onboarding',
             'kpi_code' => $input['kpi_code'],
             'kpi_domain' => 'onboarding',
             'period_start' => $input['period_start'],
             'period_end' => $input['period_end'],
             'measured_at' => now()->toIso8601String(),
-            // Inherits an inbound correlation id when supplied via ExecutionContext::$meta —
-            // see PullPerfexCrmMeasurementsAction for the full rationale.
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        // See PullPerfexCrmMeasurementsAction's execute() for why this exists.
         $primaryValue = $this->primaryValueFor($input['kpi_code'], $value);
+        $measurement = $fields + ['value' => $value, 'primary_value' => $primaryValue];
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+        if ($primaryValue === null) {
+            return ExecutionResult::ok(['measurement' => $measurement, 'zaikpi_push_skipped' => 'no single trackable value for this KPI']);
+        }
+
+        $delivery = ZaiKpiDelivery::deliver($context, $measurement);
+        if (! $delivery['ok']) {
+            return ExecutionResult::fail(
+                "Computed {$input['kpi_code']} but failed to deliver it to ZaiKPI: {$delivery['error']}",
+                ['measurement' => $measurement],
+            );
+        }
+
+        return ExecutionResult::ok([
+            'measurement' => $measurement,
+            'zaikpi_kpi_uuid' => $delivery['zaikpi_kpi_uuid'],
+            'zaikpi_measurement_uuid' => $delivery['zaikpi_measurement_uuid'],
+        ]);
     }
 
     private function primaryValueFor(string $kpiCode, array $value): ?float
@@ -146,8 +164,12 @@ class PullTourGuideMeasurementsAction extends AbstractModule
     /**
      * `content-sessions` requires a contentId per call, so pull `content` first (or use the
      * caller-supplied content_id to skip that lookup), then sessions per content id, merged.
+     * Both listContent()/listContentSessions() already follow every page internally. Period
+     * filtering uses real timestamp comparison (not raw string comparison — client-flagged bug,
+     * 2026-09-05: a bare-date period_end could wrongly exclude same-day records that carry a
+     * time component).
      */
-    private function collectSessions(TourGuideClient $client, array $input): ?Collection
+    private function collectSessions(TourGuideClient $client, array $input, int $startTs, int $endTs): ?Collection
     {
         if (! empty($input['content_id'])) {
             $contentIds = collect([$input['content_id']]);
@@ -168,12 +190,10 @@ class PullTourGuideMeasurementsAction extends AbstractModule
             $sessions = $sessions->merge($result['data']);
         }
 
-        return $sessions->filter(
-            fn ($r) => isset($r['createdAt']) && $r['createdAt'] >= $input['period_start'] && $r['createdAt'] <= $input['period_end']
-        );
+        return $sessions->filter(fn ($r) => AdapterEventEnvelope::timestampInRange($r['createdAt'] ?? null, $startTs, $endTs));
     }
 
-    private function compute(string $kpiCode, Collection $sessions, array $input): array
+    private function compute(string $kpiCode, Collection $sessions): array
     {
         $completed = $sessions->filter(fn ($r) => ! empty($r['completed']));
 

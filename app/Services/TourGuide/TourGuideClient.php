@@ -16,6 +16,10 @@ use Illuminate\Support\Facades\Http;
  * `{"error":{"code":"E1017","message":"contentId should not be empty"}}` without one) — it is
  * NOT a global pull like the original draft of this client assumed. This client therefore lists
  * `content` first, then the action pulls sessions per content id.
+ *
+ * Follows `next` through every page (client-flagged bug, 2026-09-05 review: only the first page
+ * was being read, silently dropping every KPI's later results whenever a list spans more than
+ * one page).
  */
 class TourGuideClient
 {
@@ -48,29 +52,48 @@ class TourGuideClient
         return ['ok' => $r->successful(), 'status' => $r->status(), 'body' => $r->json()];
     }
 
-    /** All content (guides/tours/checklists) — the id list content-sessions is pulled per. */
+    /** All content (guides/tours/checklists), across every page. */
     public function listContent(): array
     {
-        return $this->result($this->http()->get('content'));
+        return $this->paginatedResult('content', []);
     }
 
     /**
-     * Sessions for ONE content item — TG-GUIDE-STARTS, TG-GUIDE-COMPLETIONS,
+     * Sessions for ONE content item, across every page — TG-GUIDE-STARTS, TG-GUIDE-COMPLETIONS,
      * TG-COMPLETION-RATE and TG-FEATURE-ADOPTION are all aggregated from this, across every
      * content id (confirmed live: this endpoint requires contentId, it's not a global pull).
      */
     public function listContentSessions(string $contentId): array
     {
-        return $this->result($this->http()->get('content-sessions', ['contentId' => $contentId]));
+        return $this->paginatedResult('content-sessions', ['contentId' => $contentId]);
     }
 
-    private function result($response): array
+    /**
+     * Follows the real `next` cursor link (a full relative path, e.g.
+     * `/v1/content-sessions?cursor=...&limit=20`) until it's null, merging every page's
+     * `results`. A safety cap (50 pages) prevents an infinite loop if the API ever misbehaves.
+     */
+    private function paginatedResult(string $path, array $query): array
     {
-        return [
-            'ok' => $response->successful(),
-            'status' => $response->status(),
-            'data' => $response->json('results') ?? [],
-            'error' => $response->successful() ? null : ($response->json('message') ?? 'request_failed'),
-        ];
+        $all = [];
+        $r = $this->http()->get($path, $query);
+        if (! $r->successful()) {
+            return ['ok' => false, 'status' => $r->status(), 'data' => [], 'error' => $r->json('message') ?? 'request_failed'];
+        }
+        $all = array_merge($all, $r->json('results') ?? []);
+        $next = $r->json('next');
+
+        $pages = 0;
+        while ($next && $pages < 50) {
+            $r = Http::baseUrl($this->baseUrl)->timeout($this->timeout)->withToken($this->token)->acceptJson()->get($next);
+            if (! $r->successful()) {
+                return ['ok' => false, 'status' => $r->status(), 'data' => $all, 'error' => $r->json('message') ?? 'request_failed'];
+            }
+            $all = array_merge($all, $r->json('results') ?? []);
+            $next = $r->json('next');
+            $pages++;
+        }
+
+        return ['ok' => true, 'status' => 200, 'data' => $all, 'error' => null];
     }
 }

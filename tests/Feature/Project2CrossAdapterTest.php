@@ -31,6 +31,10 @@ use Tests\TestCase;
  * what's tested below, is producing a namespace that's structurally guaranteed to comply with
  * that policy (starts with the source's own reserved prefix) — not re-testing ZaiKPI's own DB
  * constraint, which has its own test suite in that app.
+ *
+ * Every adapter now delivers to ZaiKPI automatically (2026-09-05 client-requested fix), so
+ * `runAdapter()`/`fakeAllSources()` fake the ZaiKPI lookup+push calls too, and a real ZaiKPI
+ * connector is created in every workspace used here.
  */
 class Project2CrossAdapterTest extends TestCase
 {
@@ -69,7 +73,21 @@ class Project2CrossAdapterTest extends TestCase
         return $connector->fresh(['credentials']);
     }
 
-    /** Fakes every source's simplest successful shape so any of the 5 KPIs above succeeds. */
+    private function zaikpiConnector(Workspace $ws): Connector
+    {
+        $connector = Connector::create([
+            'workspace_id' => $ws->id, 'name' => 'zaikpi', 'slug' => 'zaikpi', 'type' => 'zaikpi',
+            'provider' => 'zaikpi', 'role' => 'target', 'status' => 'healthy', 'enabled' => true,
+            'config' => ['base_url' => 'https://kpi.dctrd.us', 'timeout' => 10],
+        ]);
+        $cred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_token', 'type' => 'secret']);
+        $cred->setSecret('test-zaikpi-token');
+        $cred->save();
+
+        return $connector->fresh(['credentials']);
+    }
+
+    /** Fakes every source's simplest successful shape, plus a successful ZaiKPI lookup+push. */
     private function fakeAllSources(): void
     {
         Http::fake([
@@ -87,6 +105,8 @@ class Project2CrossAdapterTest extends TestCase
             '*lead.dctrd.us/api/v1/leads*' => Http::response(['data' => [
                 ['id' => 1, 'status' => 'new', 'created_at' => now()->toIso8601String(), 'updated_at' => now()->toIso8601String(), 'contacted_at' => null, 'pipeline_stage_id' => null],
             ], 'meta' => ['current_page' => 1, 'last_page' => 1]], 200),
+            '*kpi.dctrd.us/api/v1/kpis?*' => Http::response(['data' => [['uuid' => 'zk-kpi-uuid']]], 200),
+            '*kpi.dctrd.us/api/v1/kpis/*/measurements' => Http::response(['data' => ['uuid' => 'zk-measurement-uuid']], 201),
         ]);
     }
 
@@ -97,6 +117,7 @@ class Project2CrossAdapterTest extends TestCase
 
         $ws = $this->workspace();
         $connector = $this->connector($ws, $sourceKey, $cfg['base_url']);
+        $this->zaikpiConnector($ws);
         $context = new ExecutionContext($ws, $connector, $correlationId ? ['correlation_id' => $correlationId] : []);
 
         $result = app($cfg['action'])->execute([
@@ -140,6 +161,7 @@ class Project2CrossAdapterTest extends TestCase
             $this->fakeAllSources();
             $ws = $this->workspace();
             $connector = $this->connector($ws, $sourceKey, $cfg['base_url']);
+            $this->zaikpiConnector($ws);
             $context = new ExecutionContext($ws, $connector);
             $tenantUuid = (string) Str::uuid();
 
@@ -150,7 +172,7 @@ class Project2CrossAdapterTest extends TestCase
                 'period_end' => now()->toIso8601String(),
             ], $context);
 
-            $this->assertTrue($result->success);
+            $this->assertTrue($result->success, "{$sourceKey} failed: {$result->error}");
             $this->assertSame($tenantUuid, $result->output['measurement']['tenant_uuid'], "{$sourceKey} did not preserve tenant_uuid exactly.");
         }
     }
@@ -187,15 +209,37 @@ class Project2CrossAdapterTest extends TestCase
     }
 
     /**
+     * Client-requested fix, 2026-09-05: "the correlation ID must continue through the ZaiKPI
+     * measurement request so that a run can be traced from source → Connector → ZaiKPI." The
+     * measurement POST body has no correlation_id field (confirmed from
+     * KpiMeasurementController::store()'s real validation rules) — the real carrier is the
+     * X-Correlation-ID header, read by ZaiKPI's own CorrelationId middleware.
+     */
+    public function test_correlation_id_reaches_the_actual_zaikpi_push_request_as_a_header(): void
+    {
+        $known = (string) Str::uuid();
+        $this->runAdapter('perfex_crm', $known);
+
+        Http::assertSent(function ($request) use ($known) {
+            if (! str_contains($request->url(), '/measurements')) {
+                return true;
+            }
+            return $request->hasHeader('X-Correlation-ID', $known);
+        });
+    }
+
+    /**
      * Runs through the REAL execution pipeline (ExecutionJob + RunExecutionJob + ModuleRegistry
      * — the same path a live webhook-triggered or scheduled pull actually takes in production),
      * not just calling execute() directly, per the doc's "A failure in one adapter does not
-     * block the other adapters" acceptance criterion.
+     * block the other adapters" acceptance criterion. Also proves RunExecutionJob really does
+     * propagate a correlation id end-to-end (client-requested fix, 2026-09-05).
      */
     public function test_one_adapter_failing_does_not_block_a_different_adapter_via_the_real_pipeline(): void
     {
         $this->fakeAllSources();
         $ws = $this->workspace();
+        $this->zaikpiConnector($ws);
 
         // Job A: Perfex CRM, deliberately no connector attached — a clean, expected failure.
         $failingJob = ExecutionJob::create([
@@ -215,6 +259,9 @@ class Project2CrossAdapterTest extends TestCase
             'input' => ['kpi_code' => 'RL-SALES', 'tenant_uuid' => (string) Str::uuid(), 'period_start' => now()->subDay()->toIso8601String(), 'period_end' => now()->toIso8601String()],
         ]);
 
+        $this->assertNotNull($failingJob->correlation_id, 'ExecutionJob must auto-generate a correlation id at creation.');
+        $this->assertNotNull($succeedingJob->correlation_id);
+
         $registry = app(ModuleRegistry::class);
         (new RunExecutionJob($failingJob->id))->handle($registry);
         (new RunExecutionJob($succeedingJob->id))->handle($registry);
@@ -227,5 +274,8 @@ class Project2CrossAdapterTest extends TestCase
 
         $this->assertSame('completed', $succeedingJob->status, 'Rocket LMS job must succeed independently even though the Perfex CRM job failed.');
         $this->assertNotNull($succeedingJob->result);
+        // The correlation id RunExecutionJob propagated into ExecutionContext reached the actual
+        // outbound ZaiKPI push, proving the full source → Connector → ZaiKPI trace survives.
+        $this->assertSame($succeedingJob->correlation_id, $succeedingJob->result['measurement']['correlation_id']);
     }
 }

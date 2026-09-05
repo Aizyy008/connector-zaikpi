@@ -8,11 +8,12 @@ use App\Modules\ExecutionResult;
 use App\Modules\ModuleHealth;
 use App\Services\MiroTalk\MiroTalkClient;
 use App\Support\KpiAdapters\AdapterEventEnvelope;
-use Illuminate\Support\Str;
+use App\Support\KpiAdapters\ZaiKpiDelivery;
 
 /**
  * MiroTalk KPI adapter (Project 2). Pulls a live snapshot measurement for an approved KPI from
- * `GET /api/v1/stats` (see project_2_v1_files/docs/05-mirotalk-{audit,data-dictionary}.md).
+ * `GET /api/v1/stats` (see project_2_v1_files/docs/05-mirotalk-{audit,data-dictionary}.md), then
+ * delivers it to ZaiKPI in the same execution (client-requested fix, 2026-09-05 review).
  *
  * IMPORTANT — these are GAUGES, not period counts. `GET /api/v1/meetings` (the only endpoint
  * that would give period-based/per-meeting detail) is confirmed disabled on this deployment, so
@@ -45,7 +46,7 @@ class PullMiroTalkMeasurementsAction extends AbstractModule
 
     public function description(): string
     {
-        return 'Reads a live snapshot measurement (active rooms, active users) from MiroTalk, for delivery to ZaiKPI.';
+        return 'Reads a live snapshot measurement (active rooms, active users) from MiroTalk, and delivers it to ZaiKPI in one execution.';
     }
 
     public function actions(): array
@@ -65,12 +66,12 @@ class PullMiroTalkMeasurementsAction extends AbstractModule
 
     public function outputSchema(): array
     {
-        return ['measurement' => 'object'];
+        return ['measurement' => 'object', 'zaikpi_kpi_uuid' => 'string', 'zaikpi_measurement_uuid' => 'string'];
     }
 
     public function scopes(): array
     {
-        return ['flows.execute', 'measurements:read'];
+        return ['flows.execute', 'measurements:read', 'measurements:write'];
     }
 
     public function healthCheck(): ModuleHealth
@@ -108,21 +109,30 @@ class PullMiroTalkMeasurementsAction extends AbstractModule
             'tenant_uuid' => $input['tenant_uuid'],
             'source_application' => 'mirotalk',
             'source_entity_type' => 'snapshot',
-            'external_uuid' => (string) Str::uuid(),
             'kpi_namespace' => 'mirotalk.usage',
             'kpi_code' => $input['kpi_code'],
             'kpi_domain' => 'usage',
             'period_start' => $input['period_start'],
             'period_end' => $input['period_end'],
             'measured_at' => now()->toIso8601String(),
-            // Inherits an inbound correlation id when supplied via ExecutionContext::$meta —
-            // see PullPerfexCrmMeasurementsAction for the full rationale.
             'correlation_id' => $context->meta['correlation_id'] ?? null,
         ]);
 
-        // See PullPerfexCrmMeasurementsAction's execute() for why this exists.
         $primaryValue = isset($value['count']) ? (float) $value['count'] : null;
+        $measurement = $fields + ['value' => $value, 'primary_value' => $primaryValue];
 
-        return ExecutionResult::ok(['measurement' => $fields + ['value' => $value, 'primary_value' => $primaryValue]]);
+        $delivery = ZaiKpiDelivery::deliver($context, $measurement);
+        if (! $delivery['ok']) {
+            return ExecutionResult::fail(
+                "Computed {$input['kpi_code']} but failed to deliver it to ZaiKPI: {$delivery['error']}",
+                ['measurement' => $measurement],
+            );
+        }
+
+        return ExecutionResult::ok([
+            'measurement' => $measurement,
+            'zaikpi_kpi_uuid' => $delivery['zaikpi_kpi_uuid'],
+            'zaikpi_measurement_uuid' => $delivery['zaikpi_measurement_uuid'],
+        ]);
     }
 }

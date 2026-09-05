@@ -5,6 +5,7 @@ namespace App\Models;
 use App\Models\Concerns\BelongsToWorkspace;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Support\Str;
 
 class ExecutionJob extends Model
 {
@@ -17,6 +18,7 @@ class ExecutionJob extends Model
         'connector_id',
         'module_id',
         'type',
+        'correlation_id',
         'status',
         'input',
         'result',
@@ -26,6 +28,17 @@ class ExecutionJob extends Model
         'started_at',
         'finished_at',
     ];
+
+    protected static function booted(): void
+    {
+        // Every job gets a correlation id at creation, even if the caller didn't supply one —
+        // client-requested (2026-09-05): "RunExecutionJob needs to propagate the correlation ID
+        // into the ExecutionContext... so that a run can be traced from source → Connector →
+        // ZaiKPI." Without this, RunExecutionJob would have nothing to propagate.
+        static::creating(function (self $job) {
+            $job->correlation_id ??= (string) Str::uuid();
+        });
+    }
 
     protected function casts(): array
     {
