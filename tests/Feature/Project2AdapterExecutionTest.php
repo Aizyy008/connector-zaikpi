@@ -685,7 +685,8 @@ class Project2AdapterExecutionTest extends TestCase
     public function test_tour_guide_pull_measurements_follows_pagination_across_multiple_pages(): void
     {
         Http::fake($this->withZaiKpiSuccess([
-            '*/v1/content*' => Http::response(['results' => [['id' => 'content-1']], 'next' => null], 200),
+            // More specific pattern MUST come first — Http::fake() uses first-match-wins, and
+            // '*/v1/content*' would otherwise also match '/v1/content-sessions...' requests.
             '*/v1/content-sessions*' => function ($request) {
                 if (str_contains($request->url(), 'cursor=page2')) {
                     return Http::response(['results' => [
@@ -697,6 +698,7 @@ class Project2AdapterExecutionTest extends TestCase
                     ['id' => 's1', 'contentId' => 'content-1', 'userId' => 'u1', 'completed' => true, 'createdAt' => '2026-08-05T00:00:00Z'],
                 ], 'next' => '/v1/content-sessions?cursor=page2&contentId=content-1'], 200);
             },
+            '*/v1/content*' => Http::response(['results' => [['id' => 'content-1']], 'next' => null], 200),
         ]));
 
         $ws = $this->workspace();
