@@ -83,8 +83,10 @@ class ZaiKpiDelivery
             'measured_at' => $measurement['measured_at'] ?? null,
         ];
 
-        $idem = $measurement['source_event_uuid'] ?? $measurement['external_uuid'];
-        $result = $client->pushMeasurement($kpiUuid, $payload, $idem, $correlationId);
+        // No Idempotency-Key header here — `source_event_uuid` in the payload above is ZaiKPI's
+        // own, purpose-built replay guard for this endpoint (see `ZaiKpiClient::pushMeasurement()`
+        // docblock for why the header was actively wrong here, found live 2026-09-05).
+        $result = $client->pushMeasurement($kpiUuid, $payload, $correlationId);
 
         if (! $result['ok']) {
             return ['ok' => false, 'error' => $result['error'] ?? 'ZaiKPI measurement push failed'];

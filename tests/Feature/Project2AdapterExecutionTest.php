@@ -336,12 +336,23 @@ class Project2AdapterExecutionTest extends TestCase
 
         // The actual outbound push to ZaiKPI carries this exact deterministic key — this is what
         // lets ZaiKPI's own replay guard (source_event_uuid match) recognize a re-run.
+        //
+        // Found live 2026-09-05 (Http::fake() alone did not catch this, which is exactly why this
+        // header is now asserted directly): a real replay against ZaiKPI failed even with this
+        // identical key, because we were ALSO sending an `Idempotency-Key` header, which ZaiKPI's
+        // separate `Idempotency` middleware checks against a SHA-256 hash of the whole request
+        // body — and that hash legitimately differs run-to-run since `measured_at` is freshly
+        // generated each time, so the middleware 409'd before the controller's own, correct
+        // `source_event_uuid` replay guard ever ran. Fixed by never sending that header on a
+        // measurement push (see `ZaiKpiClient::pushMeasurement()`); asserted here so it can't
+        // silently regress.
         Http::assertSent(function ($request) use ($first) {
             if (! str_contains($request->url(), '/measurements')) {
                 return true;
             }
             return $request['uuid'] === $first->output['measurement']['external_uuid']
-                && $request['source_event_uuid'] === $first->output['measurement']['source_event_uuid'];
+                && $request['source_event_uuid'] === $first->output['measurement']['source_event_uuid']
+                && ! $request->hasHeader('Idempotency-Key');
         });
     }
 

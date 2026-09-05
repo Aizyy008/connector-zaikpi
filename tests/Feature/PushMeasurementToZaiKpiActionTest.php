@@ -86,9 +86,15 @@ class PushMeasurementToZaiKpiActionTest extends TestCase
                 return true; // the lookup GET, not under test here
             }
 
+            // No Idempotency-Key header on a measurement push (client-review fix, 2026-09-05):
+            // ZaiKPI's separate Idempotency middleware does a stricter, body-hash-based conflict
+            // check that rejects a genuine replay whenever `measured_at` is freshly generated —
+            // `source_event_uuid` in the payload is ZaiKPI's own, correct replay guard for this
+            // endpoint, so the header would only get in its way. See ZaiKpiClient::pushMeasurement().
             return $request->hasHeader('Authorization', 'Bearer test-zaikpi-token')
-                && $request->hasHeader('Idempotency-Key')
-                && $request['measured_value'] === 5.0;
+                && ! $request->hasHeader('Idempotency-Key')
+                && $request['measured_value'] === 5.0
+                && $request['source_event_uuid'] === $request['uuid'];
         });
     }
 
