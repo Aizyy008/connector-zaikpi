@@ -72,13 +72,28 @@ class ZaiKpiDelivery
             ];
         }
 
+        // ZaiKPI's real KpiMeasurementController::store() validation has no dedicated
+        // source_entity_type/source_entity_uuid column — `notes` is the one accepted, persisted
+        // free-text field available to carry it (client-flagged fix, 2026-09-09 review: "the
+        // entity identity is not obviously carried with the measurement... propagate
+        // source_entity_type/source_entity_uuid according to the accepted ZaiKPI contract, or
+        // document exactly where it's persisted"). Documented here as the answer: it's persisted
+        // in `notes`, alongside the adapter's own value breakdown — genuinely retrievable from
+        // the stored ZaiKPI record, not just implied by the replay key. The replay key itself
+        // (`source_event_uuid`, built from AdapterEventEnvelope::deterministicUuid()) is what
+        // actually PREVENTS two entities' measurements from collapsing into one row — this is
+        // the human-readable trace of the same identity, not the isolation mechanism itself.
         $payload = [
             'uuid' => $measurement['external_uuid'],
             'period_start' => $measurement['period_start'],
             'period_end' => $measurement['period_end'],
             'measured_value' => (float) $measurement['primary_value'],
             'measurement_source' => $measurement['source_application'],
-            'notes' => isset($measurement['value']) ? json_encode($measurement['value']) : null,
+            'notes' => json_encode([
+                'source_entity_type' => $measurement['source_entity_type'] ?? null,
+                'source_entity_uuid' => $measurement['source_entity_uuid'] ?? null,
+                'value' => $measurement['value'] ?? null,
+            ]),
             'source_event_uuid' => $measurement['source_event_uuid'] ?? $measurement['external_uuid'],
             'measured_at' => $measurement['measured_at'] ?? null,
         ];

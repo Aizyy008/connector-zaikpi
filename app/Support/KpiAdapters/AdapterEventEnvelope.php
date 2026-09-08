@@ -42,6 +42,16 @@ class AdapterEventEnvelope
      * genuinely distinct per-record identity is needed (not the case for any of the 5 adapters
      * as built — every one is a period aggregate, not a per-record event).
      *
+     * The key ALSO includes `source_entity_type`/`source_entity_uuid` when the caller supplies
+     * them (client-flagged fix, 2026-09-09 review: "two different vendors/entities under the
+     * same tenant, with the same KPI and period, [could] generate the same replay key" — true
+     * before this fix, since the key ignored entity identity entirely). Rocket LMS is the adapter
+     * this matters for in practice (one Connector per vendor, `source_entity_uuid` = vendor id —
+     * see `PullRocketLmsMeasurementsAction`); Tour Guide passes one when a caller scopes a pull to
+     * a single `content_id`. The other 3 adapters never set `source_entity_uuid` (their KPIs are
+     * tenant-wide aggregates, not per-entity), so this is a no-op for them beyond the one-time key
+     * value shift explained on `DETERMINISTIC_UUID_NAMESPACE` below.
+     *
      * @param array{
      *   tenant_uuid: string,
      *   source_application: string,
@@ -78,6 +88,8 @@ class AdapterEventEnvelope
             $fields['kpi_code'],
             $fields['period_start'] ?? '',
             $fields['period_end'] ?? '',
+            $fields['source_entity_type'] ?? null,
+            $fields['source_entity_uuid'] ?? null,
         );
         $externalUuid = $fields['external_uuid'] ?? $deterministicUuid;
 
@@ -99,9 +111,24 @@ class AdapterEventEnvelope
     }
 
     /**
-     * Derive a stable (tenant, source, namespace, kpi_code, period) identity as a UUID —
-     * name-based (v5), so the SAME inputs always produce the SAME uuid, never a random one.
-     * This is what makes re-running the same KPI/period a safe replay instead of a duplicate.
+     * Derive a stable (tenant, source, entity, namespace, kpi_code, period) identity as a UUID —
+     * name-based (v5), so the SAME inputs always produce the SAME uuid, never a random one. This
+     * is what makes re-running the same entity's KPI/period a safe replay instead of a duplicate
+     * — and, since `$sourceEntityType`/`$sourceEntityUuid` are part of the input, what makes two
+     * DIFFERENT entities (e.g. two Rocket LMS vendors) under the same tenant/KPI/period produce
+     * two DIFFERENT keys instead of colliding (client-flagged fix, 2026-09-09 review).
+     *
+     * `$sourceEntityType`/`$sourceEntityUuid` are optional — omitted (null) for adapters whose
+     * KPIs are tenant-wide aggregates rather than per-entity (Perfex CRM, LeadHub, MiroTalk, and
+     * Tour Guide when not scoped to one `content_id`). Nulls are normalized to `''` in the hash
+     * input so the derivation stays deterministic either way.
+     *
+     * Adding these two inputs changes the UUID this function returns for every existing caller,
+     * even ones that never pass an entity (same overall reasoning as the namespace constant
+     * below: any change to the hash input changes the output). This is a one-time, intentional
+     * shift as part of fixing the collision bug — anything already delivered to ZaiKPI under the
+     * old formula keeps its own record; a future replay simply computes a new (now entity-aware)
+     * key and is treated as a new measurement once, then stable from then on.
      */
     public static function deterministicUuid(
         string $tenantUuid,
@@ -110,8 +137,13 @@ class AdapterEventEnvelope
         string $kpiCode,
         string $periodStart,
         string $periodEnd,
+        ?string $sourceEntityType = null,
+        ?string $sourceEntityUuid = null,
     ): string {
-        $name = implode('|', [$tenantUuid, $sourceApplication, $kpiNamespace, $kpiCode, $periodStart, $periodEnd]);
+        $name = implode('|', [
+            $tenantUuid, $sourceApplication, $kpiNamespace, $kpiCode, $periodStart, $periodEnd,
+            $sourceEntityType ?? '', $sourceEntityUuid ?? '',
+        ]);
 
         return Uuid::uuid5(self::DETERMINISTIC_UUID_NAMESPACE, $name)->toString();
     }

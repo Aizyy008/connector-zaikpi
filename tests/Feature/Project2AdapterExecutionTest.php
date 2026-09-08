@@ -36,10 +36,17 @@ class Project2AdapterExecutionTest extends TestCase
         return Workspace::create(['name' => 'Test', 'slug' => 'test-' . Str::random(8), 'environment' => 'staging', 'status' => 'active']);
     }
 
-    private function connector(Workspace $ws, string $slug, string $baseUrl, array $config = []): Connector
+    /**
+     * `$connectorSlug` lets a test create more than one Connector for the same provider in one
+     * workspace (e.g. two Rocket LMS vendor connectors) — `connectors` has a unique constraint on
+     * (workspace_id, slug), so they can't all share the provider name as their own slug. Defaults
+     * to `$slug` (unchanged behavior for every existing call site, which only ever needs one).
+     */
+    private function connector(Workspace $ws, string $slug, string $baseUrl, array $config = [], ?string $connectorSlug = null): Connector
     {
+        $uniqueSlug = $connectorSlug ?? $slug;
         $connector = Connector::create([
-            'workspace_id' => $ws->id, 'name' => $slug, 'slug' => $slug, 'type' => 'kpi_adapter',
+            'workspace_id' => $ws->id, 'name' => $uniqueSlug, 'slug' => $uniqueSlug, 'type' => 'kpi_adapter',
             'provider' => $slug, 'role' => 'source', 'status' => 'healthy', 'enabled' => true,
             'config' => ['base_url' => $baseUrl, 'timeout' => 10] + $config,
         ]);
@@ -517,6 +524,83 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertSame(1, $result->output['measurement']['value']['count']);
     }
 
+    /**
+     * Client-flagged fix, 2026-09-09 review: "the deterministic source_event_uuid... does not
+     * include source_entity_uuid/source_entity_type. This can cause two different vendors/
+     * entities under the same tenant, with the same KPI and period, to generate the same replay
+     * key... Vendor A and Vendor B producing RL-SALES for the same month must generate different
+     * source_event_uuid values." Rocket LMS is used because it's the one adapter genuinely scoped
+     * per source entity (one Connector = one vendor, see PullRocketLmsMeasurementsAction's own
+     * docblock) — this proves both required behaviors at once: same entity replayed → same key
+     * (not a duplicate); different entity, same tenant/kpi/period → different key (this is the
+     * bug that was found), and that both measurements are actually delivered to ZaiKPI as two
+     * independent pushes, each carrying its own vendor identity in `notes` (see ZaiKpiDelivery).
+     */
+    public function test_rocket_lms_replay_keys_are_isolated_per_vendor_and_stable_within_one_vendor(): void
+    {
+        Http::fake($this->withZaiKpiSuccess([
+            '*/api/development/panel/financial/sales*' => Http::response(['success' => true, 'data' => ['sales' => [
+                ['id' => 1, 'buyer_id' => 10, 'type' => 'webinar', 'total_amount' => 50, 'created_at' => strtotime('2026-08-05')],
+            ]]], 200),
+        ]));
+
+        $ws = $this->workspace();
+        $this->zaikpiConnector($ws);
+        $vendorA = $this->connector($ws, 'rocket_lms', 'https://dctrd.us', ['vendor_user_id' => 101], 'rocket_lms-vendor-a');
+        $vendorB = $this->connector($ws, 'rocket_lms', 'https://dctrd.us', ['vendor_user_id' => 202], 'rocket_lms-vendor-b');
+
+        $input = [
+            'kpi_code' => 'RL-SALES',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ];
+
+        $vendorAFirst = (new PullRocketLmsMeasurementsAction())->execute($input, new ExecutionContext($ws, $vendorA));
+        $vendorASecond = (new PullRocketLmsMeasurementsAction())->execute($input, new ExecutionContext($ws, $vendorA));
+        $vendorBFirst = (new PullRocketLmsMeasurementsAction())->execute($input, new ExecutionContext($ws, $vendorB));
+
+        $this->assertTrue($vendorAFirst->success, (string) $vendorAFirst->error);
+        $this->assertTrue($vendorASecond->success, (string) $vendorASecond->error);
+        $this->assertTrue($vendorBFirst->success, (string) $vendorBFirst->error);
+
+        // Same vendor, same KPI, same period, replayed → same key (a genuine replay).
+        $this->assertSame(
+            $vendorAFirst->output['measurement']['source_event_uuid'],
+            $vendorASecond->output['measurement']['source_event_uuid'],
+            'Replaying the same vendor/KPI/period must produce the same replay key.'
+        );
+
+        // Different vendor, same tenant/KPI/period → different key (the client-flagged bug).
+        $this->assertNotSame(
+            $vendorAFirst->output['measurement']['source_event_uuid'],
+            $vendorBFirst->output['measurement']['source_event_uuid'],
+            'Two different vendors must never share a replay key for the same kpi_code/period.'
+        );
+        $this->assertNotSame(
+            $vendorAFirst->output['measurement']['external_uuid'],
+            $vendorBFirst->output['measurement']['external_uuid'],
+        );
+
+        // Both measurements actually reached ZaiKPI as independent pushes, each carrying its own
+        // vendor's identity in `notes` — proving the entity identity is genuinely retrievable
+        // from the delivered record, not just implied by the (opaque, to a human reader) key.
+        Http::assertSent(function ($request) use ($vendorAFirst) {
+            if (! str_contains($request->url(), '/measurements') || $request['uuid'] !== $vendorAFirst->output['measurement']['external_uuid']) {
+                return false;
+            }
+            $notes = json_decode($request['notes'] ?? '{}', true);
+            return $notes['source_entity_type'] === 'vendor' && $notes['source_entity_uuid'] === '101';
+        });
+        Http::assertSent(function ($request) use ($vendorBFirst) {
+            if (! str_contains($request->url(), '/measurements') || $request['uuid'] !== $vendorBFirst->output['measurement']['external_uuid']) {
+                return false;
+            }
+            $notes = json_decode($request['notes'] ?? '{}', true);
+            return $notes['source_entity_type'] === 'vendor' && $notes['source_entity_uuid'] === '202';
+        });
+    }
+
     public function test_rocket_lms_pull_measurements_rejects_unapproved_kpi(): void
     {
         $ws = $this->workspace();
@@ -726,6 +810,40 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertTrue($result->success, (string) $result->error);
         // Both pages' sessions counted — would be 1 if pagination were still broken.
         $this->assertSame(2, $result->output['measurement']['value']['count']);
+    }
+
+    /**
+     * Client-flagged fix, 2026-09-09 review: "there is currently a safety limit around 50 pages
+     * and reaching that limit still results in a successful response... A truncated KPI result
+     * must not be reported as successful." Fakes `next` as always non-null so the safety cap
+     * (TourGuideClient::MAX_PAGES) is genuinely hit while pages still remain — the fix must
+     * report this as a failure, not a falsely-successful partial count.
+     */
+    public function test_tour_guide_pull_measurements_fails_instead_of_reporting_a_truncated_result_when_the_pagination_safety_limit_is_reached(): void
+    {
+        Http::fake($this->withZaiKpiSuccess([
+            // More specific pattern first — see the pagination test above for why.
+            '*/v1/content-sessions*' => Http::response(['results' => [
+                ['id' => 's1', 'contentId' => 'content-1', 'userId' => 'u1', 'completed' => true, 'createdAt' => '2026-08-05T00:00:00Z'],
+            ], 'next' => '/v1/content-sessions?cursor=always-more&contentId=content-1'], 200), // never terminates
+            '*/v1/content*' => Http::response(['results' => [['id' => 'content-1']], 'next' => null], 200),
+        ]));
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'tour_guide', 'https://usertour.dctrd.us');
+        $this->zaikpiConnector($ws);
+
+        $result = (new PullTourGuideMeasurementsAction())->execute([
+            'kpi_code' => 'TG-GUIDE-COMPLETIONS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01T00:00:00Z',
+            'period_end' => '2026-08-31T23:59:59Z',
+        ], new ExecutionContext($ws, $connector));
+
+        $this->assertFalse($result->success, 'A pull that hit the pagination safety limit with pages still remaining must not be reported as successful.');
+        $this->assertStringContainsString('pagination safety limit', strtolower((string) $result->error));
+        // No push to ZaiKPI must have been attempted from truncated data.
+        Http::assertNotSent(fn ($request) => str_contains($request->url(), '/measurements'));
     }
 
     public function test_tour_guide_pull_measurements_rejects_unapproved_kpi(): void

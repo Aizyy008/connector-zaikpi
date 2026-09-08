@@ -78,6 +78,34 @@ class KpiAdapterContractTest extends TestCase
         $this->assertSame(['value' => 42], $envelope['payload']);
     }
 
+    /**
+     * Client-flagged fix, 2026-09-09 review: "the deterministic source_event_uuid... does not
+     * include source_entity_uuid/source_entity_type. This can cause two different vendors/
+     * entities under the same tenant, with the same KPI and period, to generate the same replay
+     * key." Direct, fast, no-database proof against the actual pure function — see
+     * Project2AdapterExecutionTest's Rocket LMS test for the same property proven end-to-end
+     * through a real module execution.
+     */
+    public function test_deterministic_uuid_is_entity_aware(): void
+    {
+        $sameEntityFirst = AdapterEventEnvelope::deterministicUuid(
+            'tenant-A', 'rocket_lms', 'rocket_lms.marketplace', 'RL-SALES', '2026-08-01', '2026-08-31', 'vendor', 'vendor-101'
+        );
+        $sameEntitySecond = AdapterEventEnvelope::deterministicUuid(
+            'tenant-A', 'rocket_lms', 'rocket_lms.marketplace', 'RL-SALES', '2026-08-01', '2026-08-31', 'vendor', 'vendor-101'
+        );
+        $differentEntity = AdapterEventEnvelope::deterministicUuid(
+            'tenant-A', 'rocket_lms', 'rocket_lms.marketplace', 'RL-SALES', '2026-08-01', '2026-08-31', 'vendor', 'vendor-202'
+        );
+        $noEntity = AdapterEventEnvelope::deterministicUuid(
+            'tenant-A', 'rocket_lms', 'rocket_lms.marketplace', 'RL-SALES', '2026-08-01', '2026-08-31'
+        );
+
+        $this->assertSame($sameEntityFirst, $sameEntitySecond, 'Same entity + same KPI + same period must produce the same replay key.');
+        $this->assertNotSame($sameEntityFirst, $differentEntity, 'Different entity + same KPI + same period must produce a different replay key.');
+        $this->assertNotSame($sameEntityFirst, $noEntity, 'An entity-scoped key must differ from the same call with no entity at all.');
+    }
+
     public function test_idempotency_key_prefers_uuid_then_source_event_uuid_then_meta(): void
     {
         $this->assertSame(

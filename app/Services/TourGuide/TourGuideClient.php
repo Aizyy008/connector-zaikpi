@@ -23,6 +23,9 @@ use Illuminate\Support\Facades\Http;
  */
 class TourGuideClient
 {
+    /** Safety cap on pages followed per call — see paginatedResult()'s docblock for why hitting it must not be reported as success. */
+    private const MAX_PAGES = 50;
+
     public function __construct(
         private string $baseUrl,
         private string $token,
@@ -71,7 +74,13 @@ class TourGuideClient
     /**
      * Follows the real `next` cursor link (a full relative path, e.g.
      * `/v1/content-sessions?cursor=...&limit=20`) until it's null, merging every page's
-     * `results`. A safety cap (50 pages) prevents an infinite loop if the API ever misbehaves.
+     * `results`. `MAX_PAGES` still exists to prevent an infinite loop if the API ever misbehaves
+     * (keeps sending a non-null `next` forever) — but hitting it while pages genuinely remain is
+     * now reported as a FAILURE, not success (client-flagged fix, 2026-09-09 review: "reaching
+     * that limit still results in a successful response... a truncated KPI result must not be
+     * reported as successful"). Every caller (`listContent()`/`listContentSessions()`, and in
+     * turn `PullTourGuideMeasurementsAction`) already treats `ok: false` as "the pull failed" and
+     * refuses to compute or push a KPI from partial data, so this alone closes the gap.
      */
     private function paginatedResult(string $path, array $query): array
     {
@@ -84,7 +93,7 @@ class TourGuideClient
         $next = $r->json('next');
 
         $pages = 0;
-        while ($next && $pages < 50) {
+        while ($next && $pages < self::MAX_PAGES) {
             $r = Http::baseUrl($this->baseUrl)->timeout($this->timeout)->withToken($this->token)->acceptJson()->get($next);
             if (! $r->successful()) {
                 return ['ok' => false, 'status' => $r->status(), 'data' => $all, 'error' => $r->json('message') ?? 'request_failed'];
@@ -92,6 +101,15 @@ class TourGuideClient
             $all = array_merge($all, $r->json('results') ?? []);
             $next = $r->json('next');
             $pages++;
+        }
+
+        if ($next) {
+            return [
+                'ok' => false,
+                'status' => 200,
+                'data' => $all,
+                'error' => 'Pagination safety limit (' . self::MAX_PAGES . ' pages) reached while more pages were still available for ' . $path . ' — refusing to report a truncated result as successful.',
+            ];
         }
 
         return ['ok' => true, 'status' => 200, 'data' => $all, 'error' => null];

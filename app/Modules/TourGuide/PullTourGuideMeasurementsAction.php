@@ -107,12 +107,15 @@ class PullTourGuideMeasurementsAction extends AbstractModule
         $endTs = AdapterEventEnvelope::periodEndTimestamp($input['period_end']);
 
         $client = TourGuideClient::forConnector($context->connector);
-        $sessions = $this->collectSessions($client, $input, $startTs, $endTs);
-        if ($sessions === null) {
-            return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Tour Guide API call did not succeed.");
+        $collected = $this->collectSessions($client, $input, $startTs, $endTs);
+        if (! $collected['ok']) {
+            // Surfaces the client's actual error (e.g. the pagination safety-limit message, see
+            // TourGuideClient::paginatedResult()) instead of a generic string — client-flagged
+            // fix, 2026-09-09 review: a truncated pull must be diagnosable, not just "failed."
+            return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — {$collected['error']}");
         }
 
-        $value = $this->compute($input['kpi_code'], $sessions);
+        $value = $this->compute($input['kpi_code'], $collected['sessions']);
 
         $fields = AdapterEventEnvelope::contractFields([
             'tenant_uuid' => $input['tenant_uuid'],
@@ -169,14 +172,19 @@ class PullTourGuideMeasurementsAction extends AbstractModule
      * 2026-09-05: a bare-date period_end could wrongly exclude same-day records that carry a
      * time component).
      */
-    private function collectSessions(TourGuideClient $client, array $input, int $startTs, int $endTs): ?Collection
+    /**
+     * @return array{ok: bool, sessions: ?Collection, error: ?string} `error` carries the
+     *   underlying client failure (e.g. an auth error, or TourGuideClient's pagination
+     *   safety-limit message) through to the caller instead of being discarded.
+     */
+    private function collectSessions(TourGuideClient $client, array $input, int $startTs, int $endTs): array
     {
         if (! empty($input['content_id'])) {
             $contentIds = collect([$input['content_id']]);
         } else {
             $contentResult = $client->listContent();
             if (! $contentResult['ok']) {
-                return null;
+                return ['ok' => false, 'sessions' => null, 'error' => $contentResult['error'] ?? 'the Tour Guide API call did not succeed.'];
             }
             $contentIds = collect($contentResult['data'])->pluck('id')->filter();
         }
@@ -185,12 +193,14 @@ class PullTourGuideMeasurementsAction extends AbstractModule
         foreach ($contentIds as $contentId) {
             $result = $client->listContentSessions((string) $contentId);
             if (! $result['ok']) {
-                return null;
+                return ['ok' => false, 'sessions' => null, 'error' => $result['error'] ?? 'the Tour Guide API call did not succeed.'];
             }
             $sessions = $sessions->merge($result['data']);
         }
 
-        return $sessions->filter(fn ($r) => AdapterEventEnvelope::timestampInRange($r['createdAt'] ?? null, $startTs, $endTs));
+        $filtered = $sessions->filter(fn ($r) => AdapterEventEnvelope::timestampInRange($r['createdAt'] ?? null, $startTs, $endTs));
+
+        return ['ok' => true, 'sessions' => $filtered, 'error' => null];
     }
 
     private function compute(string $kpiCode, Collection $sessions): array
