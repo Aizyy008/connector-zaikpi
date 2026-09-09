@@ -111,7 +111,10 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
         // key as empty — meaning any other equally-misconfigured connector collides with it,
         // reopening exactly the bug the entity-aware key fix was meant to close. Checked before
         // any KPI computation so a misconfigured connector never gets far enough to push anything.
-        if (empty($context->connector->config['vendor_user_id'] ?? null)) {
+        $vendorUserId = $context->connector->config['vendor_user_id'] ?? null;
+        // Deliberately not empty() — a real database id could theoretically be 0, which empty()
+        // would wrongly treat as "missing." Only null or an empty string mean "not configured."
+        if ($vendorUserId === null || $vendorUserId === '') {
             return ExecutionResult::fail('This Rocket LMS connector has no vendor_user_id configured — required so this vendor\'s measurements get their own replay key and can never collide with another vendor\'s (or another misconfigured connector\'s).');
         }
         foreach (['kpi_code', 'tenant_uuid', 'period_start', 'period_end'] as $required) {
@@ -136,8 +139,8 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Rocket LMS API call did not succeed.");
         }
 
-        // Guaranteed non-empty by the fail-closed guard above.
-        $vendorId = (string) $context->connector->config['vendor_user_id'];
+        // Guaranteed non-null/non-empty-string by the fail-closed guard above.
+        $vendorId = (string) $vendorUserId;
 
         $fields = AdapterEventEnvelope::contractFields([
             'tenant_uuid' => $input['tenant_uuid'],

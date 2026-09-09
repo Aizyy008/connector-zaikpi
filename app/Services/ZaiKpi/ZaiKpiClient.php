@@ -55,14 +55,32 @@ class ZaiKpiClient
         return ['ok' => $r->successful(), 'status' => $r->status(), 'body' => $r->json()];
     }
 
-    /** Inbound (FlinkISO → ZaiKPI): create/replace a KPI definition (idempotent by UUID). */
+    /**
+     * Inbound (FlinkISO → ZaiKPI): create a KPI definition. `POST /kpis` does NOT replace an
+     * existing one — confirmed from `KpiDefinitionController::store()`'s real source: a repeat
+     * `external_uuid` for the same `source_application` gets a controlled `409
+     * duplicate_external_uuid` ("Use PUT /kpis/{uuid} to update it"), not an update (docblock
+     * corrected 2026-09-09 — it previously said "create/replace," which doesn't match the real
+     * controller).
+     *
+     * `$idempotencyKey` is deliberately reused/stable across calls for the SAME definition here
+     * (unlike `pushMeasurement()` below, which uses a fresh key every call) — and that's correct,
+     * not the same bug class fixed there on 2026-09-09. The two endpoints have different safety
+     * models: `pushMeasurement()`'s controller has its OWN graceful, lenient duplicate handling
+     * (`source_event_uuid` match → return the existing record, 200) that a stable-but-body-varying
+     * Idempotency-Key could block; this endpoint has no equivalent — a genuine retry-after-timeout
+     * of the identical definition is the ONLY case a repeat call should ever succeed gracefully,
+     * and the stable key is what makes ZaiKPI's `Idempotency` middleware recognize and safely
+     * replay that exact retry instead of hitting the controller's own hard 409 a second time.
+     */
     public function pushKpiDefinition(array $payload, ?string $idempotencyKey = null): array
     {
         $r = $this->withIdem($idempotencyKey)->post('kpis', $payload);
         return $this->result($r);
     }
 
-    /** Inbound: push a date-effective target for a KPI. */
+    /** Inbound: push a date-effective target for a KPI. Same reasoning as `pushKpiDefinition()`
+     * above for why `$idempotencyKey` is stable here, not fresh-per-call. */
     public function pushTarget(string $kpiUuid, array $payload, ?string $idempotencyKey = null): array
     {
         $r = $this->withIdem($idempotencyKey)->post("kpis/{$kpiUuid}/targets", $payload);

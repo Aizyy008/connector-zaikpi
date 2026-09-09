@@ -138,11 +138,16 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertSame('perfex_crm', $result->output['measurement']['source_application']);
         $this->assertSame('zk-measurement-uuid', $result->output['zaikpi_measurement_uuid']);
 
+        // Must specifically require the Perfex CRM request — returning true for any non-matching
+        // request (e.g. the ZaiKPI lookup, which is always recorded too) would let this pass
+        // without ever checking the header this test is actually about, since Http::assertSent()
+        // only needs ONE recorded request to satisfy the callback (client-flagged fix, 2026-09-09
+        // 3rd review — this exact bug class, found and fixed on 3 other tests, also affected the
+        // 5 source-auth-header tests in this file).
         Http::assertSent(function ($request) {
-            if (str_contains($request->url(), '/kpis')) {
-                return true;
-            }
-            return $request->hasHeader('authtoken', 'test-token') && ! $request->hasHeader('Authorization');
+            return str_contains($request->url(), '/invoices')
+                && $request->hasHeader('authtoken', 'test-token')
+                && ! $request->hasHeader('Authorization');
         });
     }
 
@@ -440,11 +445,12 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertSame(2, $result->output['measurement']['value']['count']);
         $this->assertSame('rocket_lms', $result->output['measurement']['source_application']);
 
+        // See the Perfex CRM test above for why this must specifically require the source
+        // request (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) {
-            if (str_contains($request->url(), '/kpis')) {
-                return true;
-            }
-            return $request->hasHeader('Authorization', 'Bearer test-token') && $request->hasHeader('x-api-key', 'test-api-key');
+            return str_contains($request->url(), '/financial/sales')
+                && $request->hasHeader('Authorization', 'Bearer test-token')
+                && $request->hasHeader('x-api-key', 'test-api-key');
         });
     }
 
@@ -722,11 +728,11 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertTrue($users->success, (string) $users->error);
         $this->assertSame(7, $users->output['measurement']['value']['count']);
 
+        // See the Perfex CRM test above for why this must specifically require the source
+        // request (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) {
-            if (str_contains($request->url(), '/kpis')) {
-                return true;
-            }
-            return $request->hasHeader('authorization', 'test-mirotalk-secret');
+            return str_contains($request->url(), '/stats')
+                && $request->hasHeader('authorization', 'test-mirotalk-secret');
         });
     }
 
@@ -790,11 +796,11 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertSame(3, $result->output['measurement']['value']['total']);
         $this->assertSame(2, $result->output['measurement']['value']['completed']);
 
+        // See the Perfex CRM test above for why this must specifically require the source
+        // request (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) {
-            if (str_contains($request->url(), '/kpis')) {
-                return true;
-            }
-            return $request->hasHeader('Authorization', 'Bearer test-token');
+            return str_contains($request->url(), '/content')
+                && $request->hasHeader('Authorization', 'Bearer test-token');
         });
     }
 
@@ -935,11 +941,11 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertSame(2, $result->output['measurement']['value']['count']);
         $this->assertSame('leadhub', $result->output['measurement']['source_application']);
 
+        // See the Perfex CRM test above for why this must specifically require the source
+        // request (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) {
-            if (str_contains($request->url(), '/kpis')) {
-                return true;
-            }
-            return $request->hasHeader('Authorization', 'Bearer lh_test-key');
+            return str_contains($request->url(), '/leads')
+                && $request->hasHeader('Authorization', 'Bearer lh_test-key');
         });
     }
 

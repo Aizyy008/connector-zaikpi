@@ -105,10 +105,17 @@ class Project2CrossAdapterTest extends TestCase
             '*/api/development/panel/financial/sales*' => Http::response(['success' => true, 'data' => ['sales' => [
                 ['id' => 1, 'buyer_id' => 1, 'type' => 'webinar', 'created_at' => now()->timestamp, 'amount' => '10', 'total_amount' => '10', 'refund_at' => null],
             ]]], 200),
-            '*/v1/content*' => Http::response(['results' => [['id' => 'c1']], 'next' => null], 200),
+            // More specific pattern MUST come first — Http::fake() uses first-match-wins, and
+            // '*/v1/content*' would otherwise also match '/v1/content-sessions...' requests,
+            // silently serving the wrong fake shape to every Tour Guide session call in this file
+            // (found during a proactive self-audit, 2026-09-09 — this exact ordering mistake had
+            // already bitten Project2AdapterExecutionTest.php twice; it was latent here too, just
+            // not causing a visible failure since this file's assertions don't check Tour Guide's
+            // specific KPI value, only generic cross-adapter properties).
             '*/v1/content-sessions*' => Http::response(['results' => [
                 ['id' => 's1', 'contentId' => 'c1', 'userId' => 'u1', 'completed' => true, 'createdAt' => now()->toIso8601String()],
             ], 'next' => null], 200),
+            '*/v1/content*' => Http::response(['results' => [['id' => 'c1']], 'next' => null], 200),
             '*/api/v1/stats*' => Http::response(['success' => true, 'totalRooms' => 1, 'totalUsers' => 2], 200),
             '*lead.dctrd.us/api/v1/leads*' => Http::response(['data' => [
                 ['id' => 1, 'status' => 'new', 'created_at' => now()->toIso8601String(), 'updated_at' => now()->toIso8601String(), 'contacted_at' => null, 'pipeline_stage_id' => null],
