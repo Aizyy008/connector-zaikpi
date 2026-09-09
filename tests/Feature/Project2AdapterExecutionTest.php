@@ -269,6 +269,28 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertStringContainsString('did not succeed', $result->error);
     }
 
+    /** M7's required-field-validation contract test, per adapter (proactive audit, 2026-09-09 —
+     * none of the 5 adapters had one despite the shared code enforcing it). */
+    public function test_perfex_pull_measurements_rejects_a_missing_required_field(): void
+    {
+        Http::fake();
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'perfex_crm', 'https://dctrd.us/_ERP');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullPerfexCrmMeasurementsAction())->execute([
+            'kpi_code' => 'PX-INVOICES',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            // period_end deliberately omitted
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('period_end', $result->error);
+        Http::assertNothingSent();
+    }
+
     public function test_perfex_pull_measurements_completes_the_full_pull_to_push_path_in_one_execution(): void
     {
         // Client-requested fix, 2026-09-05: "a normal execution actually performs the complete
@@ -648,6 +670,51 @@ class Project2AdapterExecutionTest extends TestCase
     }
 
     /**
+     * M7's required contract tests ("Authentication and credential-scope test") for each
+     * adapter — only Perfex had one before this proactive audit; added for the other 4 here.
+     */
+    public function test_rocket_lms_pull_measurements_fails_cleanly_on_api_error(): void
+    {
+        Http::fake(['*/api/development/panel/financial/sales*' => Http::response(['error' => 'Unauthorized'], 401)]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'rocket_lms', 'https://dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullRocketLmsMeasurementsAction())->execute([
+            'kpi_code' => 'RL-SALES',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('did not succeed', $result->error);
+    }
+
+    /** M7's required-field-validation contract test, per adapter — a missing required input
+     * field must be rejected cleanly, before any API call is made. */
+    public function test_rocket_lms_pull_measurements_rejects_a_missing_required_field(): void
+    {
+        Http::fake();
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'rocket_lms', 'https://dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullRocketLmsMeasurementsAction())->execute([
+            'kpi_code' => 'RL-SALES',
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+            // tenant_uuid deliberately omitted
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('tenant_uuid', $result->error);
+        Http::assertNothingSent();
+    }
+
+    /**
      * Client-flagged fix, 2026-09-09 3rd review: "Rocket LMS execution can still continue with a
      * null vendor_user_id; this should fail closed, otherwise two connectors without a proper
      * vendor identity can still collide." No Http::fake() needed — this must fail before any API
@@ -751,6 +818,47 @@ class Project2AdapterExecutionTest extends TestCase
 
         $this->assertFalse($result->success);
         $this->assertStringContainsString('not in the approved', $result->error);
+    }
+
+    /** M7's required contract test, per adapter (proactive audit, 2026-09-09). */
+    public function test_mirotalk_pull_measurements_fails_cleanly_on_api_error(): void
+    {
+        Http::fake(['*/api/v1/stats*' => Http::response(['error' => 'Unauthorized'], 401)]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'mirotalk', 'https://11161115.xyz');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullMiroTalkMeasurementsAction())->execute([
+            'kpi_code' => 'MT-ACTIVE-ROOMS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('did not succeed', $result->error);
+    }
+
+    /** M7's required-field-validation contract test, per adapter (proactive audit, 2026-09-09). */
+    public function test_mirotalk_pull_measurements_rejects_a_missing_required_field(): void
+    {
+        Http::fake();
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'mirotalk', 'https://11161115.xyz');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullMiroTalkMeasurementsAction())->execute([
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+            // kpi_code deliberately omitted
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('kpi_code', $result->error);
+        Http::assertNothingSent();
     }
 
     public function test_tour_guide_pull_measurements_computes_completion_rate_kpi(): void
@@ -916,6 +1024,47 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertStringContainsString('not in the approved', $result->error);
     }
 
+    /** M7's required contract test, per adapter (proactive audit, 2026-09-09). */
+    public function test_tour_guide_pull_measurements_fails_cleanly_on_api_error(): void
+    {
+        Http::fake(['*/v1/content*' => Http::response(['message' => 'Unauthorized'], 401)]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'tour_guide', 'https://usertour.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullTourGuideMeasurementsAction())->execute([
+            'kpi_code' => 'TG-GUIDE-STARTS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('Unauthorized', $result->error);
+    }
+
+    /** M7's required-field-validation contract test, per adapter (proactive audit, 2026-09-09). */
+    public function test_tour_guide_pull_measurements_rejects_a_missing_required_field(): void
+    {
+        Http::fake();
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'tour_guide', 'https://usertour.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullTourGuideMeasurementsAction())->execute([
+            'kpi_code' => 'TG-GUIDE-STARTS',
+            'tenant_uuid' => (string) Str::uuid(),
+            // period_start deliberately omitted
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('period_start', $result->error);
+        Http::assertNothingSent();
+    }
+
     public function test_leadhub_pull_measurements_computes_new_leads_kpi(): void
     {
         Http::fake($this->withZaiKpiSuccess([
@@ -1061,5 +1210,46 @@ class Project2AdapterExecutionTest extends TestCase
 
         $this->assertFalse($result->success);
         $this->assertStringContainsString('not in the approved', $result->error);
+    }
+
+    /** M7's required contract test, per adapter (proactive audit, 2026-09-09). */
+    public function test_leadhub_pull_measurements_fails_cleanly_on_api_error(): void
+    {
+        Http::fake(['*/api/v1/leads*' => Http::response(['message' => 'Unauthorized'], 401)]);
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'leadhub', 'https://lead.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullLeadHubMeasurementsAction())->execute([
+            'kpi_code' => 'LH-NEW-LEADS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('did not succeed', $result->error);
+    }
+
+    /** M7's required-field-validation contract test, per adapter (proactive audit, 2026-09-09). */
+    public function test_leadhub_pull_measurements_rejects_a_missing_required_field(): void
+    {
+        Http::fake();
+
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'leadhub', 'https://lead.dctrd.us');
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullLeadHubMeasurementsAction())->execute([
+            'kpi_code' => 'LH-NEW-LEADS',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            // period_end deliberately omitted
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('period_end', $result->error);
+        Http::assertNothingSent();
     }
 }
