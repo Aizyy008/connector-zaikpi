@@ -55,10 +55,18 @@ class Project2CrossAdapterTest extends TestCase
 
     private function connector(Workspace $ws, string $slug, string $baseUrl): Connector
     {
+        // Rocket LMS requires vendor_user_id — PullRocketLmsMeasurementsAction fails closed
+        // without one (client-flagged fix, 2026-09-09 3rd review); a fixed test value here keeps
+        // every test in this file working since none of them are testing that behavior itself
+        // (see Project2AdapterExecutionTest for the dedicated fail-closed test).
+        $config = ['base_url' => $baseUrl, 'timeout' => 10];
+        if ($slug === 'rocket_lms') {
+            $config['vendor_user_id'] = 1;
+        }
         $connector = Connector::create([
             'workspace_id' => $ws->id, 'name' => $slug, 'slug' => $slug, 'type' => 'kpi_adapter',
             'provider' => $slug, 'role' => 'source', 'status' => 'healthy', 'enabled' => true,
-            'config' => ['base_url' => $baseUrl, 'timeout' => 10],
+            'config' => $config,
         ]);
         $cred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_token', 'type' => 'secret']);
         $cred->setSecret('test-token');
@@ -220,11 +228,13 @@ class Project2CrossAdapterTest extends TestCase
         $known = (string) Str::uuid();
         $this->runAdapter('perfex_crm', $known);
 
+        // Must specifically require the /measurements POST — returning true for the preliminary
+        // KPI lookup GET too would let this pass without ever checking the actual push request,
+        // since Http::assertSent() only needs ONE recorded request to satisfy the callback
+        // (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) use ($known) {
-            if (! str_contains($request->url(), '/measurements')) {
-                return true;
-            }
-            return $request->hasHeader('X-Correlation-ID', $known);
+            return str_contains($request->url(), '/measurements')
+                && $request->hasHeader('X-Correlation-ID', $known);
         });
     }
 

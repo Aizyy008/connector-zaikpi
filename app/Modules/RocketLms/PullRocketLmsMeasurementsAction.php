@@ -22,8 +22,11 @@ use App\Support\KpiAdapters\ZaiKpiDelivery;
  * designed to run once PER CONNECTED VENDOR CREDENTIAL (one Connector = one vendor/teacher
  * login), not once for the whole platform. `tenant_uuid` stays the client's tenant; the vendor
  * identity travels in `source_entity_uuid` so ZaiKPI can tell one vendor's numbers apart from
- * another's. Per the client's 2026-09-05 confirmation, any existing test instructor/vendor
- * account is fine for now — production accounts are picked later at rollout.
+ * another's — `vendor_user_id` is therefore REQUIRED on the connector config; execution fails
+ * closed without it (client-flagged fix, 2026-09-09 3rd review), since a connector with no
+ * vendor identity would otherwise collide with any other equally-misconfigured one. Per the
+ * client's 2026-09-05 confirmation, any existing test instructor/vendor account is fine for
+ * now — production accounts are picked later at rollout.
  *
  * All 7 KPIs below trace to a real, confirmed field or model — nothing guessed. `RL-SUBSCRIPTIONS`
  * was resolved by reading `SubscribesController`/`Sale.php` source (2026-08-31): Rocket LMS's
@@ -101,6 +104,16 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
         if (! $context->connector) {
             return ExecutionResult::fail('No Rocket LMS connector bound to this execution.');
         }
+        // Fail closed on a missing vendor_user_id (client-flagged fix, 2026-09-09 3rd review):
+        // this adapter is per-vendor scoped specifically so the replay key (which now includes
+        // source_entity_uuid, see AdapterEventEnvelope) can never collide across two DIFFERENT
+        // vendors. A connector with no vendor_user_id configured would derive that part of the
+        // key as empty — meaning any other equally-misconfigured connector collides with it,
+        // reopening exactly the bug the entity-aware key fix was meant to close. Checked before
+        // any KPI computation so a misconfigured connector never gets far enough to push anything.
+        if (empty($context->connector->config['vendor_user_id'] ?? null)) {
+            return ExecutionResult::fail('This Rocket LMS connector has no vendor_user_id configured — required so this vendor\'s measurements get their own replay key and can never collide with another vendor\'s (or another misconfigured connector\'s).');
+        }
         foreach (['kpi_code', 'tenant_uuid', 'period_start', 'period_end'] as $required) {
             if (empty($input[$required])) {
                 return ExecutionResult::fail("{$required} is required.");
@@ -123,13 +136,14 @@ class PullRocketLmsMeasurementsAction extends AbstractModule
             return ExecutionResult::fail("Failed to compute {$input['kpi_code']} — the Rocket LMS API call did not succeed.");
         }
 
-        $vendorId = $context->connector->config['vendor_user_id'] ?? null;
+        // Guaranteed non-empty by the fail-closed guard above.
+        $vendorId = (string) $context->connector->config['vendor_user_id'];
 
         $fields = AdapterEventEnvelope::contractFields([
             'tenant_uuid' => $input['tenant_uuid'],
             'source_application' => 'rocket_lms',
             'source_entity_type' => 'vendor',
-            'source_entity_uuid' => $vendorId !== null ? (string) $vendorId : null,
+            'source_entity_uuid' => $vendorId,
             'kpi_namespace' => 'rocket_lms.' . $this->domainFor($input['kpi_code']),
             'kpi_code' => $input['kpi_code'],
             'kpi_domain' => $this->domainFor($input['kpi_code']),

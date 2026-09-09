@@ -98,9 +98,10 @@ class ZaiKpiDelivery
             'measured_at' => $measurement['measured_at'] ?? null,
         ];
 
-        // No Idempotency-Key header here — `source_event_uuid` in the payload above is ZaiKPI's
-        // own, purpose-built replay guard for this endpoint (see `ZaiKpiClient::pushMeasurement()`
-        // docblock for why the header was actively wrong here, found live 2026-09-05).
+        // `pushMeasurement()` sends its own fresh Idempotency-Key per request (required by the
+        // accepted Project 1.b contract) — `source_event_uuid` in the payload above is the
+        // separate, domain-level replay identifier; see ZaiKpiClient::pushMeasurement()'s
+        // docblock for why the two must not be conflated (client-corrected fix, 2026-09-09).
         $result = $client->pushMeasurement($kpiUuid, $payload, $correlationId);
 
         if (! $result['ok']) {

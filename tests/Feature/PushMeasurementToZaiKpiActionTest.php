@@ -81,18 +81,22 @@ class PushMeasurementToZaiKpiActionTest extends TestCase
         $this->assertSame('zk-kpi-uuid-1', $result->output['zaikpi_kpi_uuid']);
         $this->assertSame('zk-measurement-uuid-1', $result->output['zaikpi_measurement_uuid']);
 
+        // Must specifically require the /measurements POST — returning true for any
+        // non-matching request (e.g. the preliminary KPI lookup GET) would let this assertion
+        // pass without ever actually checking the measurement push itself, since
+        // Http::assertSent() only needs ONE recorded request to satisfy the callback
+        // (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) {
             if (! str_contains($request->url(), '/measurements')) {
-                return true; // the lookup GET, not under test here
+                return false;
             }
 
-            // No Idempotency-Key header on a measurement push (client-review fix, 2026-09-05):
-            // ZaiKPI's separate Idempotency middleware does a stricter, body-hash-based conflict
-            // check that rejects a genuine replay whenever `measured_at` is freshly generated —
-            // `source_event_uuid` in the payload is ZaiKPI's own, correct replay guard for this
-            // endpoint, so the header would only get in its way. See ZaiKpiClient::pushMeasurement().
+            // A fresh Idempotency-Key IS sent on every measurement push (required by the accepted
+            // Project 1.b contract — client-corrected fix, 2026-09-09) — `source_event_uuid` in
+            // the body remains the actual domain-level replay identifier. See
+            // ZaiKpiClient::pushMeasurement()'s docblock for the full reasoning.
             return $request->hasHeader('Authorization', 'Bearer test-zaikpi-token')
-                && ! $request->hasHeader('Idempotency-Key')
+                && $request->hasHeader('Idempotency-Key')
                 && $request['measured_value'] === 5.0
                 && $request['source_event_uuid'] === $request['uuid'];
         });

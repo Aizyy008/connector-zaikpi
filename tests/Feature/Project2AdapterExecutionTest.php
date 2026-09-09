@@ -41,14 +41,25 @@ class Project2AdapterExecutionTest extends TestCase
      * workspace (e.g. two Rocket LMS vendor connectors) — `connectors` has a unique constraint on
      * (workspace_id, slug), so they can't all share the provider name as their own slug. Defaults
      * to `$slug` (unchanged behavior for every existing call site, which only ever needs one).
+     *
+     * A Rocket LMS connector defaults to `vendor_user_id => 1` unless `$config` overrides it —
+     * `PullRocketLmsMeasurementsAction` fails closed without one (client-flagged fix, 2026-09-09
+     * 3rd review), and every pre-existing Rocket LMS test here predates that requirement, so this
+     * default keeps them all passing without touching each test body individually. Pass an
+     * explicit `vendor_user_id` (or `null`, to test the fail-closed behavior itself) via `$config`
+     * to override it.
      */
     private function connector(Workspace $ws, string $slug, string $baseUrl, array $config = [], ?string $connectorSlug = null): Connector
     {
         $uniqueSlug = $connectorSlug ?? $slug;
+        $mergedConfig = ['base_url' => $baseUrl, 'timeout' => 10] + $config;
+        if ($slug === 'rocket_lms' && ! array_key_exists('vendor_user_id', $mergedConfig)) {
+            $mergedConfig['vendor_user_id'] = 1;
+        }
         $connector = Connector::create([
             'workspace_id' => $ws->id, 'name' => $uniqueSlug, 'slug' => $uniqueSlug, 'type' => 'kpi_adapter',
             'provider' => $slug, 'role' => 'source', 'status' => 'healthy', 'enabled' => true,
-            'config' => ['base_url' => $baseUrl, 'timeout' => 10] + $config,
+            'config' => $mergedConfig,
         ]);
         $cred = new ConnectorCredential(['connector_id' => $connector->id, 'key' => 'api_token', 'type' => 'secret']);
         $cred->setSecret('test-token');
@@ -342,25 +353,37 @@ class Project2AdapterExecutionTest extends TestCase
         $this->assertNotSame($first->output['measurement']['external_uuid'], $third->output['measurement']['external_uuid']);
 
         // The actual outbound push to ZaiKPI carries this exact deterministic key — this is what
-        // lets ZaiKPI's own replay guard (source_event_uuid match) recognize a re-run.
-        //
-        // Found live 2026-09-05 (Http::fake() alone did not catch this, which is exactly why this
-        // header is now asserted directly): a real replay against ZaiKPI failed even with this
-        // identical key, because we were ALSO sending an `Idempotency-Key` header, which ZaiKPI's
-        // separate `Idempotency` middleware checks against a SHA-256 hash of the whole request
-        // body — and that hash legitimately differs run-to-run since `measured_at` is freshly
-        // generated each time, so the middleware 409'd before the controller's own, correct
-        // `source_event_uuid` replay guard ever ran. Fixed by never sending that header on a
-        // measurement push (see `ZaiKpiClient::pushMeasurement()`); asserted here so it can't
-        // silently regress.
+        // lets ZaiKPI's own replay guard (source_event_uuid match) recognize a re-run. Must
+        // specifically require the /measurements POST — returning true for the preliminary KPI
+        // lookup GET too would let this pass without ever checking the push itself, since
+        // Http::assertSent() only needs ONE recorded request to satisfy the callback
+        // (client-flagged fix, 2026-09-09 3rd review).
         Http::assertSent(function ($request) use ($first) {
-            if (! str_contains($request->url(), '/measurements')) {
-                return true;
-            }
-            return $request['uuid'] === $first->output['measurement']['external_uuid']
-                && $request['source_event_uuid'] === $first->output['measurement']['source_event_uuid']
-                && ! $request->hasHeader('Idempotency-Key');
+            return str_contains($request->url(), '/measurements')
+                && $request['uuid'] === $first->output['measurement']['external_uuid']
+                && $request['source_event_uuid'] === $first->output['measurement']['source_event_uuid'];
         });
+
+        // Idempotency-Key vs. source_event_uuid — the two must not be conflated (client-corrected
+        // fix, 2026-09-09 3rd review, reversing the 2026-09-05 fix which over-corrected by
+        // dropping the header entirely; see ZaiKpiClient::pushMeasurement()'s docblock for the
+        // full history). The accepted Project 1.b contract requires an Idempotency-Key on every
+        // write, but it must be FRESH per request — reusing source_event_uuid as if it were that
+        // header is what caused the real 2026-09-05 live bug (a genuine replay's body legitimately
+        // differs because measured_at is freshly generated, so ZaiKPI's Idempotency middleware
+        // 409'd on the reused key). Proven directly here: both measurement pushes carry a header,
+        // but two DIFFERENT values, while source_event_uuid in the body stays identical — that
+        // combination is exactly what makes a genuine replay safe under the real contract.
+        $replayUuid = $first->output['measurement']['external_uuid'];
+        $replayPushes = Http::recorded(fn ($request) => str_contains($request->url(), '/measurements') && $request['uuid'] === $replayUuid)
+            ->map(fn ($pair) => $pair[0])
+            ->values();
+        // Exactly the first and second execute() calls above (same period, genuine replay) — the
+        // third used a different period and so carries a different uuid, correctly excluded here.
+        $this->assertCount(2, $replayPushes, 'Expected exactly the 2 measurement pushes that share this replay key (first + second execute() calls).');
+        $idempotencyKeys = $replayPushes->map(fn ($request) => $request->header('Idempotency-Key')[0] ?? null);
+        $this->assertNotContains(null, $idempotencyKeys->all(), 'Every measurement push must carry an Idempotency-Key header.');
+        $this->assertNotSame($idempotencyKeys[0], $idempotencyKeys[1], 'Idempotency-Key must be fresh per request, never reused as the replay key.');
     }
 
     /** Client-requested: "tenant/source isolation" needs direct test coverage. */
@@ -616,6 +639,30 @@ class Project2AdapterExecutionTest extends TestCase
 
         $this->assertFalse($result->success);
         $this->assertStringContainsString('not in the approved', $result->error);
+    }
+
+    /**
+     * Client-flagged fix, 2026-09-09 3rd review: "Rocket LMS execution can still continue with a
+     * null vendor_user_id; this should fail closed, otherwise two connectors without a proper
+     * vendor identity can still collide." No Http::fake() needed — this must fail before any API
+     * call is made.
+     */
+    public function test_rocket_lms_pull_measurements_fails_closed_without_a_vendor_user_id(): void
+    {
+        $ws = $this->workspace();
+        $connector = $this->connector($ws, 'rocket_lms', 'https://dctrd.us', ['vendor_user_id' => null]);
+        $context = new ExecutionContext($ws, $connector);
+
+        $result = (new PullRocketLmsMeasurementsAction())->execute([
+            'kpi_code' => 'RL-SALES',
+            'tenant_uuid' => (string) Str::uuid(),
+            'period_start' => '2026-08-01',
+            'period_end' => '2026-08-31',
+        ], $context);
+
+        $this->assertFalse($result->success);
+        $this->assertStringContainsString('vendor_user_id', (string) $result->error);
+        Http::assertNothingSent();
     }
 
     public function test_rocket_lms_course_completion_averages_across_vendors_own_courses(): void

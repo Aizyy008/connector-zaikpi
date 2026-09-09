@@ -5,6 +5,7 @@ namespace App\Services\ZaiKpi;
 use App\Models\Connector;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Str;
 
 /**
  * Thin client for the ZaiKPI /api/v1 REST API. Reads its base URL from the
@@ -97,22 +98,32 @@ class ZaiKpiClient
      * Inbound (Project 2): post one aggregated measurement for a KPI already defined in ZaiKPI.
      * Real payload shape confirmed from `KpiMeasurementController::store()` — `measured_value`
      * is a single numeric (NOT the adapter's full breakdown object); `source_event_uuid` is the
-     * idempotent-replay key (a repeated one returns the existing record instead of duplicating).
+     * DOMAIN-level idempotent-replay key (a repeated one returns the existing record instead of
+     * duplicating) — this is what actually makes a replay safe, not the header below.
      *
-     * Deliberately does NOT send an `Idempotency-Key` header (unlike `pushKpiDefinition`/
-     * `pushTarget` above). Found live 2026-09-05: ZaiKPI's separate `Idempotency` middleware
-     * compares a SHA-256 hash of the whole request body against the first call's body for a
-     * repeated key, and 409s as `idempotency_key_conflict` on any difference — but this payload's
-     * `measured_at` is freshly generated on every legitimate replay (same measurement, re-sent
-     * later), so the hash never matches and a genuine replay was being rejected before
-     * `KpiMeasurementController::store()`'s own, purpose-built `source_event_uuid` replay guard
-     * (confirmed correct via a direct manual test) ever got to run. `source_event_uuid` in the
-     * payload is ZaiKPI's real mechanism for this endpoint's idempotency — the header would only
-     * duplicate it, and duplicate it incorrectly.
+     * Sends a FRESH `Idempotency-Key` on every call (client-corrected fix, 2026-09-09 3rd review:
+     * "the already accepted Project 1.b contract... requires an Idempotency-Key on writes and
+     * explicitly allows a fresh request-level Idempotency-Key when replaying the same
+     * source_event_uuid"). Generated internally, never reused — this header exists to make one
+     * literal HTTP retry of the SAME request safe (ZaiKPI's `Idempotency` middleware replays the
+     * stored response if it sees the same key with the same body hash), which is a different job
+     * from "is this logically the same measurement as one already recorded," which is what
+     * `source_event_uuid` alone answers.
+     *
+     * History: 2026-09-05 found a real live bug and, at the time, the fix was to drop this header
+     * entirely — root cause was reusing `source_event_uuid` itself AS the Idempotency-Key, so a
+     * genuine replay (same key, but a body that legitimately differs because `measured_at` is
+     * freshly generated) tripped the middleware's stricter hash-based conflict check before
+     * `KpiMeasurementController::store()`'s own `source_event_uuid` guard ever got to run. That
+     * diagnosis was correct; removing the header entirely was an over-correction — the header
+     * itself is required by the accepted Project 1.b contract. The actual fix is this: never reuse
+     * one key across separate requests. A fresh key every call means the middleware never sees a
+     * repeated key with a different body, so the 2026-09-05 bug cannot recur, while the header the
+     * contract requires is still sent.
      */
     public function pushMeasurement(string $kpiUuid, array $payload, ?string $correlationId = null): array
     {
-        $r = $this->http($correlationId)->post("kpis/{$kpiUuid}/measurements", $payload);
+        $r = $this->withIdem((string) Str::uuid(), $correlationId)->post("kpis/{$kpiUuid}/measurements", $payload);
         return $this->result($r);
     }
 
