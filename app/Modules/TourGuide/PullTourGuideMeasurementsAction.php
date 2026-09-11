@@ -63,6 +63,16 @@ class PullTourGuideMeasurementsAction extends AbstractModule
         return ['pull_measurements'];
     }
 
+    /**
+     * `content_id` is deliberately NOT listed here even though `execute()` reads it
+     * (`$input['content_id'] ?? null`) — client-flagged fix, 2026-09-11 M7 review:
+     * `Module::missingRequiredInput()` (the generic platform check `RunExecutionJob` runs before
+     * a queued job reaches this adapter at all) treats every key in `input_schema` as required,
+     * with no concept of "optional." Since `content_id` genuinely is optional (its absence means
+     * "aggregate across all content," a valid, intended mode — see `collectSessions()`), listing
+     * it here would make the generic platform check reject a legitimate, un-scoped Tour Guide
+     * execution before it ever reached this class's own (correct) optional handling.
+     */
     public function inputSchema(): array
     {
         return [
@@ -70,7 +80,6 @@ class PullTourGuideMeasurementsAction extends AbstractModule
             'tenant_uuid' => 'string',
             'period_start' => 'string',
             'period_end' => 'string',
-            'content_id' => 'string', // optional: scope to one guide/tour
         ];
     }
 

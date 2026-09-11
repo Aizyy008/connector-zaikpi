@@ -49,6 +49,17 @@ class RunExecutionJob implements ShouldQueue
                 throw new \RuntimeException("Module “{$job->type}” is not registered.");
             }
 
+            // Fail closed on a connector/workspace mismatch (client-flagged fix, 2026-09-11 —
+            // M7 "tenant-mapping and cross-tenant isolation" review): nothing previously checked
+            // that $job->connector actually belongs to $job->workspace before binding both into
+            // one ExecutionContext. A job whose connector_id pointed at a DIFFERENT workspace's
+            // connector would execute using that other workspace's real credentials while
+            // labeled under this job's own workspace/tenant — a genuine cross-tenant leak path,
+            // not merely a replay-key collision (which the entity-aware key fix already covers).
+            if ($job->connector && $job->connector->workspace_id !== $job->workspace_id) {
+                throw new \RuntimeException('This execution job’s connector does not belong to its workspace — refusing to execute across a tenant boundary.');
+            }
+
             // Re-validate required input on EVERY execution (including retries). A
             // job whose mapped input is still missing required fields must stay
             // failed — retrying without fixing the data can never complete it.

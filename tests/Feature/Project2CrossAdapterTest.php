@@ -295,4 +295,94 @@ class Project2CrossAdapterTest extends TestCase
         // outbound ZaiKPI push, proving the full source → Connector → ZaiKPI trace survives.
         $this->assertSame($succeedingJob->correlation_id, $succeedingJob->result['measurement']['correlation_id']);
     }
+
+    /**
+     * M7's "tenant-mapping and cross-tenant isolation" contract test, added per the client's
+     * 2026-09-11 review: "the current test only proves that different tenants generate different
+     * replay keys, but it does not prove that an execution using a connector/workspace/tenant
+     * combination that does not belong together is rejected." Runs through the real pipeline
+     * (`RunExecutionJob`) for all 5 adapters, each with a connector that genuinely belongs to a
+     * DIFFERENT workspace than the job itself — proves the fail-closed guard added to
+     * `RunExecutionJob::handle()` for this review rejects every one of them, before any source or
+     * ZaiKPI call is made.
+     */
+    public function test_a_job_whose_connector_belongs_to_a_different_workspace_is_rejected_for_every_adapter(): void
+    {
+        $this->fakeAllSources();
+        $registry = app(ModuleRegistry::class);
+
+        foreach (self::ADAPTER_SLUGS as $slug => $meta) {
+            $ownWorkspace = $this->workspace();
+            $otherWorkspace = $this->workspace();
+            // The connector genuinely belongs to $otherWorkspace...
+            $foreignConnector = $this->connector($otherWorkspace, $slug, $meta['base_url']);
+
+            // ...but the job claims $ownWorkspace as its tenant boundary.
+            $job = ExecutionJob::create([
+                'workspace_id' => $ownWorkspace->id,
+                'connector_id' => $foreignConnector->id,
+                'type' => "{$slug}.pull_measurements",
+                'status' => 'pending',
+                'input' => [
+                    'kpi_code' => $meta['kpi'],
+                    'tenant_uuid' => (string) Str::uuid(),
+                    'period_start' => now()->subDay()->toIso8601String(),
+                    'period_end' => now()->toIso8601String(),
+                ],
+            ]);
+
+            (new RunExecutionJob($job->id))->handle($registry);
+            $job->refresh();
+
+            $this->assertSame('failed', $job->status, "{$slug}: a job whose connector belongs to a different workspace must be rejected.");
+            $this->assertStringContainsString('tenant boundary', (string) $job->error, "{$slug}: the rejection reason should explain the tenant-boundary mismatch.");
+        }
+
+        // Rejection happens before ANY source or ZaiKPI call — proves this is a genuine
+        // fail-closed guard, not a downstream failure that happened to also reject.
+        Http::assertNothingSent();
+    }
+
+    /**
+     * Client-flagged fix, 2026-09-11 M7 review: "content_id is described and handled by the
+     * adapter as optional, but the generic input-schema validation appears to treat every schema
+     * field as required, which can reject a Tour Guide execution without content_id before the
+     * adapter runs." Confirmed true — `Module::missingRequiredInput()` (the check
+     * `RunExecutionJob` runs against the real `modules` DB row, populated by
+     * `ModuleRegistry::sync()`) has no concept of "optional," so `content_id` being listed in
+     * `inputSchema()` made every un-scoped (aggregate-mode) Tour Guide job fail before reaching
+     * the adapter at all. No prior test caught this because none seeded a real `Module` row —
+     * this one does, deliberately, to exercise the exact check that was rejecting real queued
+     * executions.
+     */
+    public function test_tour_guide_job_without_content_id_succeeds_through_the_real_queued_pipeline(): void
+    {
+        app(ModuleRegistry::class)->sync();
+        $this->fakeAllSources();
+
+        $ws = $this->workspace();
+        $this->zaikpiConnector($ws);
+        $connector = $this->connector($ws, 'tour_guide', 'https://usertour.dctrd.us');
+
+        $job = ExecutionJob::create([
+            'workspace_id' => $ws->id,
+            'connector_id' => $connector->id,
+            'type' => 'tour_guide.pull_measurements',
+            'status' => 'pending',
+            'input' => [
+                'kpi_code' => 'TG-GUIDE-STARTS',
+                'tenant_uuid' => (string) Str::uuid(),
+                'period_start' => now()->subDay()->toIso8601String(),
+                'period_end' => now()->toIso8601String(),
+                // content_id deliberately omitted — the legitimate "aggregate across all
+                // content" mode this bug was silently rejecting before ever reaching the adapter.
+            ],
+        ]);
+
+        (new RunExecutionJob($job->id))->handle(app(ModuleRegistry::class));
+        $job->refresh();
+
+        $this->assertSame('completed', $job->status, (string) $job->error);
+        $this->assertNotNull($job->result);
+    }
 }
